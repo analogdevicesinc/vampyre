@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.8.1, 12-Mar-2021
+# version 1.8.2, 02-May-2021
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -5298,8 +5298,12 @@ def parseLines( lines ):
             # parameters, variables, ports
             #
             elif part.startswith("parameter") or part.startswith("aliasparam") or part.startswith("localparam") or \
+                     part.startswith("inout") or part.startswith("input") or part.startswith("output") or \
                     (part.startswith("real") and part[4].isspace()) or (part.startswith("integer") and part[7].isspace()) or \
                     (part.startswith("genvar") and part[6].isspace()):
+                is_port_dir = False
+                if part.startswith("inout") or part.startswith("input") or part.startswith("output"):
+                    is_port_dir = True
                 if part[-1] != ';' and i >= len(parts):
                     tmpline = part
                     tmpj = j
@@ -5310,6 +5314,9 @@ def parseLines( lines ):
                             nparts = nextln.split()
                             if nparts[0] in gVAMSkeywords and not nparts[0] in gMathFunctions:
                                 break
+                            if is_port_dir and (nparts[0] in ["inout", "input", "output"] or nparts[0] in gDisciplines):
+                                # missing ; so don't join this part
+                                break
                             tmpline += " " + nextln
                             tmpline = tmpline.strip()
                         tmpj += 1
@@ -5319,10 +5326,10 @@ def parseLines( lines ):
                         gLineNo[-1] = j
                 if part.startswith("parameter") or part.startswith("aliasparam") or part.startswith("localparam"):
                     parseParamDecl(part, attribs)
+                elif part.startswith("inout") or part.startswith("input") or part.startswith("output"):
+                    parsePortDirection(part)
                 else:
                     parseVariableDecl(part, attribs)
-            elif part.startswith("inout") or part.startswith("input") or part.startswith("output"):
-                parsePortDirection(part)
 
             # statements (and other content)
             #
@@ -5529,6 +5536,7 @@ def parseFile( filename ):
     first_inside_ifdef = -1
     indent_multiline_define = -1
     indent_define = -1
+    indent_before_define = 0
     first_define_indent = -1
     special_define_indent = 0
     indent_this_define = -1
@@ -5537,6 +5545,7 @@ def parseFile( filename ):
     in_case_block = False
     continued_line = ""
     unclosed_parens = 0
+    paren_continued_lines = 0
     dos_format = -1
 
     # handle comments and line-continuation characters
@@ -5577,6 +5586,10 @@ def parseFile( filename ):
                 if fixed_line != orig_line:
                     did_fix = True
         else:
+            if continued_line == "parentheses":
+                paren_continued_lines += 1
+            else:
+                paren_continued_lines = 0
             if line.find("//") >= 0 or line.find("/*") >= 0:
                 retval = removeComments(line, in_comment)
                 line = retval[0]
@@ -5589,9 +5602,7 @@ def parseFile( filename ):
                 if stripped == "":
                     if in_multiline_define:
                         in_multiline_define = False
-                        if indent_this_define > 0:
-                            if required_indent >= gSpcPerInd:
-                                required_indent -= gSpcPerInd
+                        required_indent = indent_before_define
                         indent_this_define = -1
                     if optional_indent > 0 and orig_line.strip() != "":
                         if indent >= required_indent + optional_indent:
@@ -5609,7 +5620,15 @@ def parseFile( filename ):
                                     first_inside_ifdef = gLineNo[-1]
                     stripped = orig_line.strip()
                     if stripped != "":
-                        fixed_line = makeIndent(required_indent+single_line_indent) + stripped + "\n"
+                        this_indent = required_indent+single_line_indent
+                        if stripped[0:2] == "//":
+                            if indent_define == 0 and stripped.find("`define") > 0:
+                                this_indent = 0
+                            if indent_ifdef == 0:
+                                if stripped.find("`ifdef") > 0 or stripped.find("`ifndef") > 0 \
+                                        or stripped.find("`else") > 0 or stripped.find("`endif") > 0:
+                                    this_indent = 0
+                        fixed_line = makeIndent(this_indent) + stripped + "\n"
                     else:
                         fixed_line = "\n"
                 else:
@@ -5659,7 +5678,7 @@ def parseFile( filename ):
                         if (indent_ifdef != 0 and stripped.startswith("`else")) or \
                                (indent_ifdef == -1 and stripped.startswith("`endif")):
                             this_indent -= gSpcPerInd
-                    elif in_multiline_define:
+                    if in_multiline_define:
                         this_indent += special_define_indent
                     previous_single_indent = single_line_indent
                     if single_line_indent > 0:
@@ -5761,6 +5780,7 @@ def parseFile( filename ):
                                 in_case_block = True
                         elif keywd == "end" or (in_case_block and keywd == "default"):
                             # required_indent decreased above for "end"
+                            num_parens = 0
                             while val != 0:
                                 val = parser.lex()
                                 if parser.isIdentifier():
@@ -5770,6 +5790,14 @@ def parseFile( filename ):
                                         optional_indent = 0
                                         required_indent += gSpcPerInd
                                         single_line_indent = 0
+                                    elif str == "end":
+                                        required_indent -= gSpcPerInd
+                                elif val == ord('('):
+                                    num_parens += 1
+                                elif val == ord(')'):
+                                    num_parens -= 1
+                                elif val == ord(';') and num_parens == 0:
+                                    single_line_indent = 0
                         else:
                             val = parser.lex()
                             if val == ord('='):
@@ -5795,6 +5823,7 @@ def parseFile( filename ):
                                 if gFixIndent and indent > this_indent:
                                     fixed_line = makeIndent(this_indent) + fixed_line.strip() + "\n"
                             if keywd == "define":
+                                indent_before_define = required_indent
                                 if required_indent > 0:
                                     if indent == 0:
                                         if indent_define == -1:
@@ -5897,10 +5926,6 @@ def parseFile( filename ):
                                     bad_indent = True
                                     if indent_ifdef == 0:
                                         this_indent = 0
-                    if in_multiline_define and line[-2] != '\\':
-                        if indent_this_define > 0:
-                            if required_indent >= gSpcPerInd:
-                                required_indent -= gSpcPerInd
                     if bad_indent and continued_line != "" and indent > this_indent:
                         bad_indent = False
                     elif indent_this_define == 0 and not is_vams_compdir:
@@ -5913,6 +5938,7 @@ def parseFile( filename ):
                         fixed_line = makeIndent(this_indent) + fixed_line.strip() + "\n"
                     if in_multiline_define and line[-2] != '\\':
                         in_multiline_define = False
+                        required_indent = indent_before_define
                         indent_this_define = -1
                     # try to determine if this line continues
                     if continued_line == "no_semicolon":
@@ -5934,11 +5960,15 @@ def parseFile( filename ):
                                 continued_line = "no_semicolon"
                             else:
                                 num_parens = 0
+                                in_quote = False
                                 for ch in line:
-                                    if ch == '(':
-                                        num_parens += 1
-                                    elif ch == ')':
-                                        num_parens -= 1
+                                    if ch == '"':
+                                        in_quote = not in_quote
+                                    if not in_quote:
+                                        if ch == '(':
+                                            num_parens += 1
+                                        elif ch == ')':
+                                            num_parens -= 1
                                 if num_parens > 0:
                                     continued_line = "parentheses"
                                     unclosed_parens = num_parens
@@ -5955,6 +5985,9 @@ def parseFile( filename ):
         else:
             linesToParse.append(lineToParse)
             lineToParse = ""
+
+    if continued_line == "parentheses":
+        warning("Unclosed parenthesis at end of file %s (opened on line %d)" % (filename, (gLineNo[-1]-paren_continued_lines)))
 
     # write file, if there are any changes
     if gFixIndent:
@@ -6019,7 +6052,7 @@ class versionAction(argparse.Action):
         return
     def __call__(self, parser, namespace, values, option_string=None):
         print("""
-VAMPyRE version 1.8.1
+VAMPyRE version 1.8.2
 """)
         sys.exit()
 
