@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.8, 14-Jan-2021
+# version 1.8.1, 12-Mar-2021
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -16,7 +16,7 @@
 # 9) use of features not appropriate for compact models
 #10) various issues of poor coding style
 #11) compliance with CMC Verilog-A Code Standards:
-#   - use of lower-case identifiers
+#   - use of lowercase identifiers
 #   - proper use of tref and dtemp
 #   - proper use of the multiplicity attribute
 #12) misuse of limexp
@@ -169,7 +169,7 @@ for fn in ["idtmod", "absdelay", "analysis", "transition", "slew", "last_crossin
     gMathFunctions[fn] = 99
 
 # units for multiplicity checking
-gUnitsMultiply = ["A", "Amp", "Amps", "F", "Farads", "C", "coul", "Coulomb", "Coulombs", "W", "Watt", "Watts", "A/V", "S", "mho", "A*V", "A*V/K", "A/K", "C/K", "s*W/K"]
+gUnitsMultiply = ["A", "Amp", "Amps", "F", "Farads", "C", "coul", "Coulomb", "Coulombs", "W", "Watt", "Watts", "A/V", "S", "mho", "A*V", "A*V/K", "A/K", "C/K", "s*W/K", "A/V^2", "A^2/Hz"]
 gUnitsDivide   = ["Ohm", "Ohms", "V/A", "K/W"]
 
 
@@ -1146,10 +1146,13 @@ class Parser:
             if expr.is_int:
                 warning("Integer divide")
             factors = getParamFactors(expr.e2)
+            zero_factors = []
             for pname in factors:
-                if not checkParameterRangeExclude(pname, 0):
+                if not checkParameterRangeExclude(pname, 0) and not pname in zero_factors:
                     if not checkConditionsExclude(pname, 0, self.ternary_condition):
-                        warning("Possible division by zero for parameter %s" % pname)
+                        zero_factors.append(pname)
+            for pname in zero_factors:
+                warning("Possible division by zero for parameter %s" % pname)
     return expr
 
   def parseAdditive(self, is_cond):
@@ -3255,7 +3258,7 @@ def checkPorts():
             if port.name.upper() != port.name:
                 warning("Mixed-case port name '%s'" % port.name)
             elif gStyle:
-                style("Port names should be lower-case ('%s' not '%s')" % (port.name.lower(), port.name))
+                style("Port names should be lowercase ('%s' not '%s')" % (port.name.lower(), port.name))
         gLineNo.pop()
         gFileName.pop()
 
@@ -3321,16 +3324,16 @@ def checkParmsAndVars():
     if len(not_lower) > 0:
         if len(not_upper) == 0:
             if gStyle:
-                style("Parameters should be declared in lower-case")
+                style("Parameters should be declared in lowercase")
         else:
             if len(not_lower) == 1 and len(all_lower) > 5:
                 bad = not_lower[0]
-                warning("Parameters have inconsistent case (all lower-case except '%s')" % bad)
+                warning("Parameters have inconsistent case (all lowercase except '%s')" % bad)
             elif len(not_upper) == 1 and len(all_upper) > 5:
                 bad = not_upper[0]
-                warning("Parameters have inconsistent case (all upper-case except '%s')" % bad)
+                warning("Parameters have inconsistent case (all uppercase except '%s')" % bad)
             else:
-                warning("Parameters have inconsistent case (prefer all lower-case)")
+                warning("Parameters have inconsistent case (prefer all lowercase)")
     if not some_units and len(gParameters) > 0:
         warning("No units specified for any parameters")
 
@@ -5517,6 +5520,7 @@ def parseFile( filename ):
     single_line_indent = 0
     previous_single_indent = 0
     indent_module = -1
+    first_module_indent = 0
     ifdef_depth = 0
     indents_in_ifdefs = []
     indent_ifdef = -1
@@ -5669,7 +5673,7 @@ def parseFile( filename ):
                     if indent != this_indent:
                         bad_indent = True
                         if indent > this_indent:
-                            if optional_indent_reason == "ifdef" and indent_inside_ifdef == 0:
+                            if optional_indent > 0 and optional_indent_reason == "ifdef" and indent_inside_ifdef == 0:
                                 style("Inconsistent indentation inside `ifdef (compare with line %d)" % first_inside_ifdef )
                             else:
                                 if indent == this_indent + optional_indent:
@@ -5678,9 +5682,7 @@ def parseFile( filename ):
                                 this_indent += optional_indent
                                 if optional_indent_reason == "module":
                                     indent_module = 1
-                                    if ifdef_depth > 0 and len(indents_in_ifdefs) == ifdef_depth:
-                                        depths = indents_in_ifdefs[ifdef_depth-1]
-                                        depths[0] += optional_indent
+                                    first_module_indent = gLineNo[-1]
                                 elif optional_indent_reason == "define":
                                     if indent_multiline_define == -1:
                                         indent_multiline_define = 1
@@ -5699,7 +5701,19 @@ def parseFile( filename ):
                                 optional_indent_reason = ""
                     elif indent == this_indent and optional_indent > 0:
                         if optional_indent_reason == "module":
-                            indent_module = 0
+                            if indent_module == 1:
+                                if ifdef_depth > 0 and len(indents_in_ifdefs) == ifdef_depth:
+                                    depths = indents_in_ifdefs[ifdef_depth-1]
+                                    if depths[1] == -1:
+                                        depths[0] += optional_indent
+                                    else:
+                                        required_indent += optional_indent
+                                if val != ord('`'):
+                                    style("Inconsistent indentation inside module block (compare with line %d)" % first_module_indent )
+                                    if gFixIndent:
+                                        fixed_line = makeIndent(required_indent) + fixed_line.strip() + "\n"
+                            else:
+                                indent_module = 0
                         elif optional_indent_reason == "define":
                             if indent_multiline_define == -1:
                                 indent_multiline_define = 0
@@ -6005,7 +6019,7 @@ class versionAction(argparse.Action):
         return
     def __call__(self, parser, namespace, values, option_string=None):
         print("""
-VAMPyRE version 1.8
+VAMPyRE version 1.8.1
 """)
         sys.exit()
 
