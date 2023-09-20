@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.8.3, 24-May-2021
+# version 1.8.4, 21-July-2021
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -47,7 +47,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.8.3"
+gVersionNumber = "1.8.4"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -70,6 +70,7 @@ gAnalogBlock   = [] # analog or analog initial
 gMissingConstantsFile = ""
 gStatementInCurrentBlock = False
 gLastDisplayTask = []
+gLastLineWasEvent = False
 gCurrentFunc   = 0
 gFileName      = []
 gLineNo        = []
@@ -719,7 +720,6 @@ class Parser:
     global TOKEN_NUMBER, TOKEN_IDENTIFIER, TOKEN_STRING
     self.eatSpace()
     ch = self.peekChar()
-    #print("ch='%s'" % ch)
     if ch == "":
         self.token = 0
     elif ch.isdigit():
@@ -771,7 +771,7 @@ class Parser:
     ch = self.peekChar()
     if ch in "+-*/%><!&|=~^?:":
         oper = ch
-        if self.cp < self.end:
+        if self.cp < self.end-1:
             next = self.line[self.cp+1]
         else:
             next = ""
@@ -898,6 +898,14 @@ class Parser:
     if self.isIdentifier():
         expr = Expression("NAME")
         expr.e1 = self.getString()
+        while self.peekChar() == '.':
+            # hierarchical identifier
+            expr.e1 += self.getChar()
+            val = self.lex()
+            if self.isIdentifier():
+                expr.e1 += self.getString()
+            else:
+                error("invalid hierarchical identifier %s" % expr.e1)
     elif self.isNumber():
         expr = Expression("NUMBER")
         expr.number = self.getNumber()
@@ -1450,9 +1458,20 @@ class Parser:
             var = gVariables[name]
         else:
             var = False
-            sname = getCurrentScope() + name
-            if sname in gVariables:
-                var = gVariables[sname]
+            scope = getCurrentScope()
+            while not var:
+                vn = scope + name
+                if vn in gVariables:
+                    var = gVariables[vn]
+                    break
+                if scope != "":
+                    scopes = scope.split(".")
+                    scope = ""
+                    if len(scopes) > 2:
+                        for sc in scopes[0:-2]:
+                            scope += sc + "."
+                else:
+                    break
         if not port and not var:
             error("Identifier '%s' is not a vector port or array, cannot index" % name)
         sel = self.getExpression()
@@ -1485,6 +1504,67 @@ class Parser:
             error("missing ']' after bus index")
     return True
 
+  def getParmRange(self, pname, r_or_ex):
+    val = self.lex()
+    lend = ""
+    if val == ord('['):
+        lend = "c"
+    elif val == ord('('):
+        lend = "o"
+    elif val == ord(';'):
+        parse_error = True
+        error("Missing range after 'from'")
+        return [val, float("-inf"), float("inf"), "nb"]
+    else:
+        error("Invalid %s in %s" % (format_char(val), r_or_ex))
+    pmin = self.getExpression()
+    if pmin.type == "NOTHING":
+        error("Missing lower bound in %s" % r_or_ex)
+    elif pmin.type == "NAME" and pmin.e1 in gParameters:
+        gParameters[pmin.e1].used = True
+    val = self.lex()
+    if val == ord(';'):
+        error("Incomplete %s" % r_or_ex)
+        return [val, pmin, float("inf"), "nb"]
+    elif val != ord(':'):
+        error("Invalid %s for range separator" % format_char(val))
+    pmax = self.getExpression()
+    if pmax.type == "NOTHING":
+        error("Missing upper bound in %s" % r_or_ex)
+    elif pmax.type == "NAME" and pmax.e1 in gParameters:
+        gParameters[pmax.e1].used = True
+    val = self.lex()
+    rend = ""
+    if val == ord(']'):
+        rend = "c"
+    elif val == ord(')'):
+        rend = "o"
+    elif val == ord(';'):
+        parse_error = True
+        error("Missing ')' or ']' in %s" % r_or_ex)
+        return [val, pmin, pmax, "nb"]
+    else:
+        error("Invalid %s in %s" % (format_char(val), r_or_ex))
+    pvalrng = lend + rend
+    if rend == "c" and pmax.type == "NAME" and pmax.e1 == "inf":
+        if lend == "c" and pmin.type == "-" and pmin.e1.type == "NAME" and pmin.e1.e1 == "inf":
+            error("Invalid %s [-inf:inf] for parameter '%s'; should be (-inf:inf)" % (r_or_ex, pname), "Invalid range [-inf:inf]")
+        else:
+            if lend == "c":
+                lend = "["
+            elif lend == "o":
+                lend = "("
+            lend = lend + pmin.asString()
+            error("Invalid %s %s:inf] for parameter '%s'; should be %s:inf)" % (r_or_ex, lend, pname, lend), "Invalid range inf]")
+    elif lend == "c" and pmin.type == "-" and pmin.e1.type == "NAME" and pmin.e1.e1 == "inf":
+        if rend == "c":
+            rend = "]"
+        elif rend == "o":
+            rend = ")"
+        rend = pmax.asString() + rend
+        error("Invalid %s [-inf:%s for parameter '%s'; should be (-inf:%s" % (r_or_ex, rend, pname, rend), "Invalid range [-inf:inf]")
+    val = self.lex()
+    return [val, pmin, pmax, pvalrng]
 
   def getBusRange(self):
     bus_range = []
@@ -1664,7 +1744,7 @@ def getSimpleValue(expr, m_or_l, char):
     else:
         warning("Cannot determine range %s from '%s'" % (m_or_l, expr.asString()))
     return [value, valid]
-    
+
 
 # get a numerical value for range (min/max)
 def getRangeValue(expr):
@@ -2189,7 +2269,6 @@ def parseMacro( line ):
                 value = line[i:]
             else:
                 value = ""
-            #print("Define %s as %s" % (name, value))
             if name in gVAMScompdir:
                 error("Invalid macro name '%s'" % name)
             else:
@@ -2232,10 +2311,6 @@ def parseUndef( line ):
 
 
 def replaceFormalWithActual( text, args, actuals, check_collision ):
-    #print("replaceFormalWithActual")
-    #print("    %s" % text)
-    #print(args)
-    #print(actuals)
     # check if actual argument contains match for later formal argument
     if check_collision:
         collide = False
@@ -2245,8 +2320,6 @@ def replaceFormalWithActual( text, args, actuals, check_collision ):
                 arg = args[j]
                 if act.find(arg) >= 0:
                     collide = True
-                    #print("actual %d:%s" % (i,act))
-                    #print("formal %d:%s" % (j,arg))
                     break
             if collide:
                 break
@@ -2260,7 +2333,6 @@ def replaceFormalWithActual( text, args, actuals, check_collision ):
             args = newargs
     for i in range(len(args)):
         arg = args[i]
-        #print("Looking for '%s' in text, to replace with %s" % (arg,actuals[i]))
         in_quote = False
         word_bnd = True
         j = 0
@@ -2282,7 +2354,6 @@ def replaceFormalWithActual( text, args, actuals, check_collision ):
                 else:
                     word_bnd = True
             j += 1
-    #print("    %s" % text)
     return text
 
 
@@ -2668,7 +2739,10 @@ def initializeModule():
 
 # print summary
 def printModuleSummary():
-    print("\nModule: %s" % gModuleName)
+    if len(gModuleName):
+       print("\nModule: %s" % gModuleName)
+    else:
+       print("\nNo module declaration found")
     if len(gParameters):
         InstParms = {}
         ModelParms = {}
@@ -2933,7 +3007,6 @@ def parseParamDecl( line, attribs ):
             return
 
         parm.defv = parser.getExpression()
-        #print("parameter %s defv type %s" % (pname, parm.defv.type))
         if parm.defv.type == "ARRAY" or len(parm.range) > 0:
             if parm.defv.type != "ARRAY":
                 error("Array parameter '%s' needs array of default values" % pname)
@@ -2999,6 +3072,8 @@ def parseParamDecl( line, attribs ):
                         error("Parameter '%s' default value may not depend on node '%s'" % (pname, dep))
                     elif dep in gBranches:
                         error("Parameter '%s' default value may not depend on branch '%s'" % (pname, dep))
+                    elif dep == "inf":
+                        error("Infinity (inf) may only be used in ranges; not a valid default value for parameter '%s'" % pname)
                     else:
                         error("Parameter '%s' default value depends on unknown identifier '%s'" % (pname, dep))
 
@@ -3031,79 +3106,27 @@ def parseParamDecl( line, attribs ):
                         error("Invalid %s in range" % format_char(val))
                         break
                 elif str == "from":
-                    val = parser.lex()
-                    lend = ""
-                    if val == ord('['):
-                        lend = "c"
-                    elif val == ord('('):
-                        lend = "o"
-                    elif val == ord(';'):
-                        parse_error = True
-                        error("Missing range after 'from'")
-                        break
-                    else:
-                        error("Invalid %s in range" % format_char(val))
-                    parm.min = parser.getExpression()
-                    if parm.min.type == "NOTHING":
-                        error("Missing lower bound in range")
-                    elif parm.min.type == "NAME" and parm.min.e1 in gParameters:
-                        gParameters[parm.min.e1].used = True
-                    val = parser.lex()
-                    if val == ord(';'):
-                        error("Incomplete range")
-                        break
-                    elif val != ord(':'):
-                        error("Invalid %s for range separator" % format_char(val))
-                    parm.max = parser.getExpression()
-                    if parm.max.type == "NOTHING":
-                        error("Missing upper bound in range")
-                    elif parm.max.type == "NAME" and parm.max.e1 in gParameters:
-                        gParameters[parm.max.e1].used = True
-                    val = parser.lex()
-                    rend = ""
-                    if val == ord(']'):
-                        rend = "c"
-                    elif val == ord(')'):
-                        rend = "o"
-                    elif val == ord(';'):
-                        parse_error = True
-                        error("Missing ')' or ']' in range")
-                        break
-                    else:
-                        error("Invalid %s in range" % format_char(val))
-                    parm.value_range = lend + rend
-                    if rend == "c" and parm.max.type == "NAME" and parm.max.e1 == "inf":
-                        if lend == "c" and parm.min.type == "-" and parm.min.e1.type == "NAME" and parm.min.e1.e1 == "inf":
-                            error("Invalid range [-inf:inf] for parameter '%s'; should be (-inf:inf)" % parm.name, "Invalid range [-inf:inf]")
-                        else:
-                            if lend == "c":
-                                lend = "["
-                            elif lend == "o":
-                                lend = "("
-                            lend = lend + parm.min.asString()
-                            error("Invalid range %s:inf] for parameter '%s'; should be %s:inf)" % (lend, parm.name, lend), "Invalid range inf]")
-                    elif lend == "c" and parm.min.type == "-" and parm.min.e1.type == "NAME" and parm.min.e1.e1 == "inf":
-                        if rend == "c":
-                            rend = "]"
-                        elif rend == "o":
-                            rend = ")"
-                        rend = parm.max.asString() + rend
-                        error("Invalid range [-inf:%s for parameter '%s'; should be (-inf:%s" % (rend, parm.name, rend), "Invalid range [-inf:inf]")
-                    val = parser.lex()
+                    [val, parm.min, parm.max, parm.value_range] = parser.getParmRange(parm.name, "range")
                 elif str == "exclude":
-                    exclude = parser.getExpression()
-                    if exclude.type == "NUMBER":
-                        parm.exclude.append(exclude.number)
-                    elif exclude.type == "NAME":
-                        if exclude.e1 in gParameters:
-                            gParameters[exclude.e1].used = True
-                        else:
-                            warning("Parameter range 'exclude %s' is not valid" % exclude.e1)
-                    elif exclude.type == "NOTHING":
-                        error("Missing value for 'exclude'")
+                    parser.eatSpace()
+                    val = parser.peekChar()
+                    if val == '[' or val == '(':
+                        # exclude range, parsed but ignored
+                        [val, pmin, pmax, pvalrng] = parser.getParmRange(parm.name, "exclude")
                     else:
-                        warning("Unsupported exclusion of type %s" % exclude.type)
-                    val = parser.lex()
+                        exclude = parser.getExpression()
+                        if exclude.type == "NUMBER":
+                            parm.exclude.append(exclude.number)
+                        elif exclude.type == "NAME":
+                            if exclude.e1 in gParameters:
+                                gParameters[exclude.e1].used = True
+                            else:
+                                warning("Parameter range 'exclude %s' is not valid" % exclude.e1)
+                        elif exclude.type == "NOTHING":
+                            error("Missing value for 'exclude'")
+                        else:
+                            warning("Unsupported exclusion of type %s" % exclude.type)
+                        val = parser.lex()
                 else: # pragma: no cover
                     fatal("Unexpected '%s' in parameter declaration" % str)
 
@@ -3712,7 +3735,6 @@ def conditionCovered( test, condlist ):
                 else:
                     newonly.append(op)
             if len(oldonly) == 0:
-                #print("cond      %s\nsubset of %s" % (test,cond))
                 retval = True
                 break
     return retval
@@ -4123,7 +4145,7 @@ def parseOther( line ):
     global gConditionForNextStmt, gConditionForLastStmt
     global gCondBiasDForNextStmt, gCondBiasDForLastStmt
     global gStatementInCurrentBlock
-    global gLastDisplayTask
+    global gLastDisplayTask, gLastLineWasEvent
     global gAnalogBlock
 
     this_cond = gConditionForNextStmt
@@ -4138,6 +4160,9 @@ def parseOther( line ):
 
     parser = Parser(line)
     val = parser.lex()
+    if val == ord(';') and gLastLineWasEvent:
+        # null statement
+        val = parser.lex()
     keywd = ""
 
     if parser.isIdentifier():
@@ -4727,7 +4752,7 @@ def parseOther( line ):
                        "tran", "rtran", "pulldown", "pullup"]: # pragma: no cover
             error("Gate instantiation '%s' not expected in compact model" % keywd)
 
-        elif keywd in ["resistor", "capacitor", "inductor"]: # pragma: no cover
+        elif keywd in ["resistor", "capacitor", "inductor", "tline"]: # pragma: no cover
             if analog_block == "None":
                 warning("Spice instantiation '%s' not recommended" % keywd)
             else:
@@ -4836,7 +4861,7 @@ def parseOther( line ):
                     else: # pragma: no cover
                         fatal("Unexpected '%s' after assignment" % keywd)
 
-            elif val == ord('('):
+            elif val == ord('(') or (val == ord(';') and keywd in ["$fatal", "$error", "$warning", "$finish", "$stop"]):
                 if keywd in gAccessFuncs:
                     gStatementInCurrentBlock = True
                     acc = keywd
@@ -4951,32 +4976,38 @@ def parseOther( line ):
                     else:
                         error("Missing ';' after contribution")
 
-                elif keywd in ["$strobe", "$display", "$monitor", "$write", "$debug", \
+                elif keywd in ["$strobe", "$display", "$monitor", "$write", "$debug", "$bound_step", \
                                "$fatal", "$error", "$warning", "$finish", "$stop"]:
                     gStatementInCurrentBlock = True
-                    args = parser.parseArgList()
+                    if val == ord('('):
+                        args = parser.parseArgList()
+                    else:
+                        args = []
                     if keywd in ["$finish", "$stop"]:
+                        arg = ""
                         if len(gLastDisplayTask) > 2 and gFileName[-1] == gLastDisplayTask[1] and gLineNo[-1] >= gLastDisplayTask[2]:
-                            arg = ""
                             if len(args) > 0:
-                                arg = args[0].asString()
-                            notice("$error(msg) preferred over %s(msg); %s(%s);" % (gLastDisplayTask[0], keywd, arg))
+                                arg = "(" + args[0].asString() + ")"
+                            notice("$error(msg) preferred over %s(msg); %s%s;" % (gLastDisplayTask[0], keywd, arg))
                         else:
-                            notice("$error() preferred over %s()" % keywd)
+                            if val == ord('('):
+                                arg = ()
+                            notice("$error() preferred over %s%s" % (keywd, arg))
                     elif keywd == "$debug":
                         warning("%s() may degrade performance" % keywd)
                     elif keywd in ["$strobe", "$display", "$write"]:
                         gLastDisplayTask = [keywd, gFileName[-1], gLineNo[-1]]
 
-                    deps = []
-                    for arg in args:
-                        deps += arg.getDependencies(False, False)
-                    checkDependencies(deps, "Task %s references" % keywd, this_c_bd, False, True)
-                    val = parser.lex()
-                    if val == ord(')'):
+                    if val == ord('('):
+                        deps = []
+                        for arg in args:
+                            deps += arg.getDependencies(False, False)
+                        checkDependencies(deps, "Task %s references" % keywd, this_c_bd, False, True)
                         val = parser.lex()
-                    else:
-                        error("Missing ')' in call of task %s" % keywd)
+                        if val == ord(')'):
+                            val = parser.lex()
+                        else:
+                            error("Missing ')' in call of task %s" % keywd)
                     if keywd in ["$finish", "$stop"]:
                         if len(args) == 1:
                             if args[0].type != "NUMBER":
@@ -4987,6 +5018,8 @@ def parseOther( line ):
                         if len(args) >= 1:
                             if args[0].type != "NUMBER":
                                 error("Argument to %s must be a number" % keywd)
+                    elif keywd == "$bound_step":
+                        warning("Task '%s' should not be used in a compact model" % keywd)
                     else:
                         if len(args) == 0:
                             error("Expected at least 1 argument for %s" % keywd)
@@ -5019,6 +5052,7 @@ def parseOther( line ):
 
     elif val == ord('@'):
         error("Events (@) should not be used in compact models")
+        gLastLineWasEvent = True
         #  @ (initial_step or initial_step("static","pss") or initial_step("static","pdisto")) begin
         val = parser.lex()
         args = []
@@ -5525,7 +5559,7 @@ def parseLines( lines ):
                                 num_parens += 1
                             elif ch == ')':
                                 num_parens -= 1
-                        if num_parens > 0:
+                        if num_parens > 0 or tmpline[-1] in ["+", "-", "*", "/"]:
                             nextln = lines[tmpj]
                             nextln = handleCompilerDirectives(nextln)
                             tmpline += " " + nextln
