@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.5, 30-Oct-2020
+# version 1.6, 25-Nov-2020
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -67,7 +67,7 @@ gScopeList     = []
 gConditions    = [] # if-conditions in play
 gCondBiasDep   = [] # whether conditions are bias-dependent:
                     # 0 (no), 1 (from if cond), 2 (yes), 3 (deriv error), 4 (ddx)
-gAnalogInitial = []
+gAnalogBlock = []
 gCurrentFunc   = 0
 gFileName      = []
 gLineNo        = []
@@ -273,7 +273,7 @@ class Expression:
     elif self.type == "FUNCCALL":
         deps = []
         if self.e1 in gAccessFuncs:
-            if len(gAnalogInitial) > 0 and gAnalogInitial[-1]:
+            if len(gAnalogBlock) > 0 and gAnalogBlock[-1] == "initial":
                 error("Branch access in analog initial block")
             nargs = len(self.args)
             if nargs > 0:
@@ -718,6 +718,8 @@ class Parser:
         self.token = TOKEN_STRING
     else:
         ch = self.getChar()
+        if ord(ch) > 127:
+            error("Encountered non-ASCII character '%s' (decimal %d)" % (ch, ord(ch)) )
         self.token = ord(ch)
     return self.token
 
@@ -958,20 +960,18 @@ class Parser:
                           % (len(args), fname, nargs))
                 if fname == "log":
                     warning("Found base-10 log(); use ln() for natural log")
-                elif (fname == "ln" or fname == "sqrt") and len(args) == 1:
+                if fname in ["ln", "log", "sqrt"] and len(args) == 1:
                     arg = args[0]
+                    allow_zero = False
+                    if fname == "sqrt":
+                        allow_zero = True
                     if arg.type == "NAME" and arg.e1 in gParameters:
                         pname = arg.e1
-                        check_cond = False
-                        allow_zero = False
-                        if fname == "ln" and not checkParamRangePos(pname, False):
-                            check_cond = True
-                        elif fname == "sqrt" and not checkParamRangePos(pname, True):
-                            check_cond = True
-                            allow_zero = True
-                        if check_cond:
+                        if not checkParamRangePos(pname, allow_zero):
                             if not checkConditionsRequirePositive(pname, allow_zero, self.ternary_condition):
-                                warning("Possible invalid function call for '%s(%s)'" % (fname, pname))
+                                warning("Parameter range allows values not in domain of function '%s(%s)'" % (fname, pname))
+                    elif checkFuncArgNoConditions(arg):
+                        warning("Parameter range(s) allow negative argument to function '%s(%s)'" % (fname, arg.asString()))
             elif fname in gUserFunctions:
                 if gUserFunctions[fname].type == "integer":
                     expr.is_int = True
@@ -1058,22 +1058,41 @@ class Parser:
     oper = self.peekOper()
     if oper == "-":               # Unary minus
         oper = self.getOper()
+        do_warn = ""
+        if self.peekOper() == "-":
+            do_warn = "-"
+        elif self.peekOper() == "+":
+            do_warn = "-+"
         arg = self.parsePrefix(is_cond)
         if arg.type == "NUMBER":
-            expr = arg
+            expr = Expression("NUMBER")
             expr.number = -arg.number
         else:
             expr = Expression(oper)
             expr.e1 = arg
             expr.is_int = arg.is_int
+        if do_warn != "":
+            warning("Adjacent unary operators: '%s%s'" % (do_warn, arg.asString()))
     elif oper == "+":             # Unary plus
         oper = self.getOper()
+        do_warn = ""
+        if self.peekOper() == "+":
+            do_warn = "++"
+        elif self.peekOper() == "-":
+            do_warn = "+"
         expr = self.parsePrefix(is_cond)
+        if do_warn != "":
+            warning("Adjacent unary operators: '%s%s'" % (do_warn, expr.asString()))
     elif oper == "!":             # Logical not
         oper = self.getOper()
+        do_warn = ""
+        if self.peekOper() == "!":
+            do_warn = "!!"
         arg = self.parsePrefix(is_cond)
         expr = Expression(oper)
         expr.e1 = arg
+        if do_warn != "":
+            warning("Adjacent unary operators: '%s%s'" % (do_warn, expr.asString()))
     elif oper == "~":             # Bitwise not
         oper = self.getOper()
         warning("Unexpected bitwise operator '%s'" % oper)
@@ -1431,13 +1450,15 @@ def fatal( message ): # pragma: no cover
     sys.exit(1)
 
 
-def error( message ):
+def error( message, type=None ):
     global gErrorMsgDict, gMaxNum, gFileName, gLineNo
+    if type is None:
+        type = message
     count = 0
-    if message in gErrorMsgDict:
-        count = gErrorMsgDict[message]
+    if type in gErrorMsgDict:
+        count = gErrorMsgDict[type]
     count += 1
-    gErrorMsgDict[message] = count
+    gErrorMsgDict[type] = count
     if count <= gMaxNum or gMaxNum == 0:
         if len(gLineNo) > 0:
             print("ERROR in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
@@ -1578,7 +1599,7 @@ def checkParamRangeNeg( pname, allow_zero ):
             # from (-inf:b], b<0
             if b < 0 or (allow_zero and b == 0):
                 return True
-        elif parm.range == "oc" or parm.range == "oo":
+        elif parm.range == "co" or parm.range == "oo":
             # from (-inf:b), b<=0
             if b <= 0:
                 return True
@@ -1741,6 +1762,55 @@ def checkConditionsRequirePositive( pname, allow_zero, extra_cond ):
         # ternary condition
         requires |= checkConditionsRequirePosOper(extra_cond.type, extra_cond.e1, extra_cond.e2, False, pname, allow_zero, True)
     return requires
+
+# check if parameter ranges allow negative argument
+# (abort checking if conditions are in play, too hard to check in general)
+def checkFuncArgNoConditions(arg):
+    global gConditions
+    allows = False
+    can_check = True
+    for cond in gConditions:
+        if cond.type != "NOTHING":
+            can_check = False
+    if can_check:
+        if arg.type in ["+","-","*","/"]:
+            e1_can_be_neg = False
+            e1_must_be_neg = False
+            if arg.e1.type == "NAME" and arg.e1.e1 in gParameters:
+                if not checkParamRangePos(arg.e1.e1, True):
+                    e1_can_be_neg = True
+                if checkParamRangeNeg(arg.e1.e1, False):
+                    e1_must_be_neg = True
+            elif arg.e1.type == "NUMBER" and arg.e1.e1 < 0:
+                e1_can_be_neg = True
+                e1_must_be_neg = True
+            else:
+                can_check = False
+            e2_can_be_neg = False
+            e2_must_be_neg = False
+            e2_can_be_pos = False
+            if arg.e2.type == "NAME" and arg.e2.e1 in gParameters:
+                if not checkParamRangePos(arg.e2.e1, True):
+                    e2_can_be_neg = True
+                if checkParamRangeNeg(arg.e2.e1, False):
+                    e2_must_be_neg = True
+            elif arg.e2.type == "NUMBER":
+                if arg.e2.e1 < 0:
+                    e2_can_be_neg = True
+                    e2_must_be_neg = True
+                elif arg.e2.e1 > 0:
+                    e2_can_be_pos = True
+            else:
+                can_check = False
+            if can_check:
+                if arg.type == "+" and (e1_can_be_neg or e2_can_be_neg):
+                    allows = True
+                elif arg.type == "*" or arg.type == "/":
+                    if (e1_can_be_neg or e2_can_be_neg) and not (e1_must_be_neg and e2_must_be_neg):
+                        allows = True
+                elif arg.type == "-" and (e1_can_be_neg or e2_can_be_pos):
+                    allows = True
+    return allows
 
 
 def checkIdentifierCollisions( basename, name, escaped, type ):
@@ -2671,6 +2741,23 @@ def parseParamDecl( line, attribs ):
                 else:
                     error("Invalid %s in range" % format_char(val))
                 parm.range = lend + rend
+                if rend == "c" and parm.max.type == "NAME" and parm.max.e1 == "inf":
+                    if lend == "c" and parm.min.type == "-" and parm.min.e1.type == "NAME" and parm.min.e1.e1 == "inf":
+                        error("Invalid range [-inf:inf] for parameter '%s'; should be (-inf:inf)" % parm.name, "Invalid range [-inf:inf]")
+                    else:
+                        if lend == "c":
+                            lend = "["
+                        elif lend == "o":
+                            lend = "("
+                        lend = lend + parm.min.asString()
+                        error("Invalid range %s:inf] for parameter '%s'; should be %s:inf)" % (lend, parm.name, lend), "Invalid range inf]")
+                elif lend == "c" and parm.min.type == "-" and parm.min.e1.type == "NAME" and parm.min.e1.e1 == "inf":
+                    if rend == "c":
+                        rend = "]"
+                    elif rend == "o":
+                        rend = ")"
+                    rend = rend + parm.min.asString()
+                    error("Invalid range [-inf:%s for parameter '%s'; should be (-inf:%s" % (rend, parm.name, rend), "Invalid range [-inf:inf]")
                 val = parser.lex()
             elif str == "exclude":
                 exclude = parser.getExpression()
@@ -3005,6 +3092,7 @@ def checkParmsAndVars():
     all_upper = []
     not_lower = []
     not_upper = []
+    some_units = False
     param_names_lower = []
     for par in gParameters.values():
         gFileName.append(par.declare[0])
@@ -3044,6 +3132,8 @@ def checkParmsAndVars():
             all_upper.append(par.name)
         else:
             not_upper.append(par.name)
+        if par.units:
+            some_units = True
         gLineNo.pop()
         gFileName.pop()
     if temp.used > 0:
@@ -3064,6 +3154,8 @@ def checkParmsAndVars():
                 warning("Parameters have inconsistent case (all upper-case except '%s')" % bad)
             else:
                 warning("Parameters have inconsistent case (prefer all lower-case)")
+    if not some_units:
+        warning("No units specified for any parameters")
 
     for var in gVariables.values():
         if var.name.startswith("FUNCTION::"):
@@ -3676,7 +3768,7 @@ def parseOther( line ):
     global gConditionForNextStmt, gConditionForLastStmt
     global gCondBiasDForNextStmt, gCondBiasDForLastStmt
     global gStatementInCurrentBlock
-    global gAnalogInitial
+    global gAnalogBlock
 
     this_cond = gConditionForNextStmt
     gConditionForNextStmt = Expression("NOTHING")
@@ -3686,7 +3778,7 @@ def parseOther( line ):
     gCondBiasDForNextStmt = 0
     last_c_bd = gCondBiasDForLastStmt
     gCondBiasDForLastStmt = 0
-    is_analog_initial = False
+    analog_block = "None"
 
     parser = Parser(line)
     val = parser.lex()
@@ -3696,12 +3788,13 @@ def parseOther( line ):
         keywd = parser.getString()
         if keywd == "analog":
             gStatementInCurrentBlock = True
+            analog_block = "analog"
             val = parser.lex()
             keywd = parser.getString()
             if keywd == "initial":
                 val = parser.lex()
                 warning("Restrictions in 'analog initial' not checked")
-                is_analog_initial = True
+                analog_block = "initial"
 
     if parser.isNumber() or (keywd == "default" and parser.peekChar() == ":"):
         if len(gScopeList) > 0 and gScopeList[-1].startswith("CASE::"):
@@ -3754,19 +3847,17 @@ def parseOther( line ):
             if len(gScopeList) > 0:
                 gScopeList.pop()
             if len(gConditions) > 0:
-                last_cond = gConditions[-1]
-                gConditions.pop()
+                last_cond = gConditions.pop()
             if len(gCondBiasDep) > 0:
-                last_c_bd = gCondBiasDep[-1]
-                gCondBiasDep.pop()
+                last_c_bd = gCondBiasDep.pop()
             if bad_scope:
                 error("Found 'end' without corresponding 'begin'")
-            if len(gAnalogInitial) > 0:
-                gAnalogInitial.pop()
-            if len(gAnalogInitial) > 0:
-                is_analog_initial = gAnalogInitial[-1]
+            if len(gAnalogBlock) > 0:
+                gAnalogBlock.pop()
+            if len(gAnalogBlock) > 0:
+                analog_block = gAnalogBlock[-1]
             else:
-                is_analog_initial = False
+                analog_block = "None"
             val = parser.lex()
             if parser.isIdentifier():
                 keywd = parser.getString()
@@ -4024,7 +4115,7 @@ def parseOther( line ):
             gCondBiasDep.append(this_c_bd)
             this_cond = Expression("NOTHING")
             this_c_bd = 0
-            gAnalogInitial.append(is_analog_initial)
+            gAnalogBlock.append(analog_block)
 
         if keywd == "case":
             var = parser.getExpression()
@@ -4214,9 +4305,16 @@ def parseOther( line ):
                        "tran", "rtran", "pulldown", "pullup"]: # pragma: no cover
             error("Gate instantiation '%s' not expected in compact model" % keywd)
 
+        elif keywd in ["resistor", "capacitor", "inductor"]: # pragma: no cover
+            if analog_block == "None":
+                warning("Spice instantiation '%s' not recommended" % keywd)
+            else:
+                error("Spice instantiation '%s' inside analog block" % keywd)
+            val = 0
+
         elif keywd in ["always", "initial"]: # pragma: no cover
             error("Digital '%s' blocks not supported in Verilog-A" % keywd)
-            rest = parser.getRestOfLine()
+            val = parser.lex()
 
         elif keywd in ["task", "endtask"]: # pragma: no cover
             error("Tasks not supported in compact models")
@@ -4308,7 +4406,7 @@ def parseOther( line ):
                 if keywd in gAccessFuncs:
                     gStatementInCurrentBlock = True
                     acc = keywd
-                    if is_analog_initial:
+                    if analog_block == "initial":
                         error("Branch access in analog initial block")
                     nname1 = ""
                     nname2 = ""
@@ -5585,7 +5683,7 @@ class versionAction(argparse.Action):
         return
     def __call__(self, parser, namespace, values, option_string=None):
         print("""
-VAMPyRE version 1.5
+VAMPyRE version 1.6
 """)
         sys.exit()
 
