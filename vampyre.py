@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.8.5, 12-Aug-2021
+# version 1.8.6, 22-Nov-2021
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
+#    or conditionally-assigned operating point values
 # 2) unused parameters or variables
 # 3) division by zero for parameters (1/parm where parm's range allows 0)
 #    or domain errors for ln() and sqrt()
@@ -21,6 +22,7 @@
 #   - proper use of the multiplicity attribute
 #12) misuse of limexp
 #13) various problems with binning equations
+#14) nonlinear ddt() expressions
 #
 # Copyright (c) 2021 Analog Devices, Inc.
 #
@@ -47,7 +49,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.8.5"
+gVersionNumber = "1.8.6"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -172,7 +174,7 @@ for fn in ["idtmod", "absdelay", "analysis", "transition", "slew", "last_crossin
 
 # units for multiplicity checking
 gUnitsMultiply = ["A", "Amp", "Amps", "F", "Farads", "C", "coul", "Coulomb", "Coulombs", "W", "Watt", "Watts", "A/V", "S", "mho", "A*V", "A*V/K", "A/K", "C/K", "s*W/K", "A/V^2", "A^2/Hz"]
-gUnitsDivide   = ["Ohm", "Ohms", "V/A", "K/W"]
+gUnitsDivide   = ["Ohm", "Ohms", "V/A", "K/W", "V^2/Hz"]
 
 
 ################################################################################
@@ -240,10 +242,12 @@ class Variable:
     self.oppt = oppt         # operating-point variable
     self.declare = [file, line]
     self.assign = -1         # line where value assigned
+    self.prev_assign = []    # details about previous assignment
     self.conditions = []     # conditions when assigned
     self.used = False        # whether used
     self.bias_dep = 0        # bias-dependent: 0=no, 1=from if cond, 2=yes, 3=deriv error, 4=ddx
     self.biases = []         # node voltages (for ddx check)
+    self.ddt_use = 0         # involves ddt: 0=no, 1=linear, 2=nonlinear
     self.funcNameAndArg = ["", 0] # tracing whether function output arg is used
 
 class Port:
@@ -377,7 +381,7 @@ class Expression:
             if len(self.args) == 1:
                 arg = self.args[0]
                 deps = arg.getDependencies(assign_context, branch_contrib)
-                [bias_dep, biases] = checkDependencies(deps, "Call to function '%s' depends on" % self.e1, 0, False, False)
+                [bias_dep, biases, ddt] = checkDependencies(deps, "Call to function '%s' depends on" % self.e1, 0, False, True, False)
                 if not bias_dep:
                     warning("Call to %s(%s), but argument is not bias-dependent" % (self.e1, arg.asString()))
             # else: warning issued elsewhere
@@ -415,7 +419,9 @@ class Expression:
                 # note: acc does not add a dependency if arg does not already depend on acc
                 if acc.type == "FUNCCALL" and acc.e1 in gAccessFuncs:
                     accstr = acc.asString()
-                    [bias_dep, biases] = checkDependencies(argdeps, "", 0, False, False)
+                    [bias_dep, biases, ddt] = checkDependencies(argdeps, "Call to ddx() depends on", 0, False, True, False)
+                    if ddt:
+                        error("Call to ddx() where argument %s involves ddt()" % arg.asString())
                     if not accstr in biases:
                         warning("Call to ddx(), but %s does not depend on %s" % (arg.asString(), acc.asString()))
                         if gDebug:
@@ -425,9 +431,12 @@ class Expression:
                                             "laplace_zp", "laplace_zd", "laplace_np", "laplace_nd", \
                                             "zi_zp", "zi_zd", "zi_np", "zi_nd"]:
             # ignore dependencies in noise functions and laplace and z operators
-            pass
+            if assign_context and self.e1 in ["white_noise", "flicker_noise", "noise_table", "noise_table_log"]:
+                warning("Small-signal noise source '%s' in assignment" % self.e1)
         else:
             out_arg_pos = []
+            if assign_context and self.e1 == "ddt":
+                deps = ["ddt"]
             if self.e1 in gUserFunctions:
                 # find positions of output arguments
                 funcdef = gUserFunctions[self.e1]
@@ -446,11 +455,11 @@ class Expression:
                 else:
                     deps += arg.getDependencies(assign_context, branch_contrib)
             if assign_context and len(out_arg_pos) > 0:
-                [bias_dep, biases] = checkDependencies(deps, "Call to function '%s' depends on" % self.e1, 0, False, True)
+                [bias_dep, biases, ddt] = checkDependencies(deps, "Call to function '%s' depends on" % self.e1, 0, False, False, True)
                 for i in range(len(self.args)):
                     if i in out_arg_pos:
                         arg = self.args[i]
-                        markVariableAsSet(arg.e1, bias_dep, Expression("NOTHING"), biases, False, True, self.e1, i)
+                        markVariableAsSet(arg.e1, bias_dep, Expression("NOTHING"), biases, 0, False, True, self.e1, i)
         return deps
 
     elif self.type in ["!", "~"]:
@@ -481,6 +490,83 @@ class Expression:
         return dep1 + dep2 + dep3
     else: # pragma: no cover
         fatal("Unhandled expression type '%s' in getDependencies" % self.type)
+
+  def ddtCheck(self):
+    if self.type == "NAME":
+        if self.e1 in gParameters:
+            return 0
+        else:
+            scope = getCurrentScope()
+            found = False
+            while not found:
+                vn = scope + self.e1
+                if vn in gVariables:
+                    return gVariables[vn].ddt_use
+                if scope != "":
+                    scopes = scope.split(".")
+                    scope = ""
+                    if len(scopes) > 2:
+                        for sc in scopes[0:-2]:
+                            scope += sc + "."
+                else:
+                    break
+            if not found:
+                fatal("Unexpected identifier '%s' in ddtCheck" % self.e1)
+    elif self.type == "NUMBER" or self.type == "STRING":
+        return 0
+    elif self.type == "FUNCCALL":
+        if self.e1 in gAccessFuncs:
+            return 0
+        elif self.e1 == "ddt":
+            return 1 + self.args[0].ddtCheck()
+        else:
+            for arg in self.args:
+                ddt1 = arg.ddtCheck()
+                if ddt1 > 0:
+                    return 2 # nonlinear
+        return 0
+    elif self.type in ["+", "-"]:
+        ddt1 = self.e1.ddtCheck()
+        if self.e2:
+            ddt2 = self.e2.ddtCheck()
+        else:
+            ddt2 = 0
+        if ddt1 > ddt2:
+            return ddt1
+        else:
+            return ddt2
+    elif self.type in ["*", "/", "%", "**"]:
+        ddt1 = self.e1.ddtCheck()
+        ddt2 = self.e2.ddtCheck()
+        if ddt1 == 0 and ddt2 == 0:
+            return 0
+        elif ddt1 == 1 and ddt2 == 0 and self.type in ["*", "/"]:
+            return 1
+        elif ddt1 == 0 and ddt2 == 1 and self.type == "*":
+            return 1
+        else:
+            return 2 # assume nonlinear
+    elif self.type in ["?:"]:
+        ddt1 = self.e1.ddtCheck()
+        ddt2 = self.e2.ddtCheck()
+        ddt3 = self.e3.ddtCheck()
+        if ddt1 == 0:
+            if ddt2 > ddt3:
+                return ddt2
+            else:
+                return ddt3
+        else:
+            error("ddt() dependence in condition for ?: operator")
+    elif self.type in ["!", "~"]:
+        error("ddt() dependence in operand for '%s' operator" % self.type)
+    elif self.type in ["==", "!=", "<", ">", "<=", ">=", \
+                       "&&", "||", "&", "|", "^", \
+                       "<<", ">>", "<<<", ">>>", "===", "!==", \
+                       "^~", "~^", "~&", "~|"]:
+        error("ddt() dependence in operands for '%s' operator" % self.type)
+    else: # pragma: no cover
+        fatal("Unhandled expression type '%s' in ddtCheck" % self.type)
+    return ddt
 
   def asString(self):
     if self.type == "NAME" or self.type == "STRING":
@@ -3201,7 +3287,11 @@ def parseVariableDecl( line, attribs ):
                         if multi != "\"divide\"":
                             warning("Operating-point variable %s should have multiplicity=\"divide\"" % var.name, "multiplicity")
                     elif multi != "":
-                        warning("Unexpected multiplicity=%s for operating-point variable %s with units %s" % (multi, var.name, units), "multiplicity")
+                        if units == "":
+                            unitstr = "no units"
+                        else:
+                            unitstr = "units '" + units + "'"
+                        warning("Unexpected multiplicity=%s for operating-point variable '%s' with %s" % (multi, var.name, unitstr), "multiplicity")
                 gVariables[vname] = var
                 if len(gScopeList) > 0 and gScopeList[-1].startswith("FUNCTION::"):
                     if gCurrentFunction:
@@ -3565,6 +3655,12 @@ def checkParmsAndVars():
                 warning("Variable '%s' was never used" % var.name)
             elif var.used and var.name == "$vt":
                 warning("$vt not recommended; value differs slightly between simulators")
+            elif var.oppt and var.conditions != []:
+                gFileName.append(var.declare[0])
+                gLineNo.append(var.declare[1])
+                error("Operating-point variable '%s' is only conditionally assigned a value" % var.name)
+                gLineNo.pop()
+                gFileName.pop()
             if var.oppt and var.name.lower() in param_names_lower:
                 parname = ""
                 for par in gParameters.values():
@@ -3597,9 +3693,10 @@ def getIdentifierType( name ):
     return type
 
 
-def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, do_warn ):
+def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt, do_warn ):
     [conds, bias_dep] = getCurrentConditions(Expression("NOTHING"), bias_dep_in)
     biases = []
+    ddt_call = 0
     if is_condition:
         # condition for an if, for, while, case statement
         # don't use bias_dep from getCurrentConditions
@@ -3617,6 +3714,11 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, do_war
             is_set = True
             found = True
             scope = ""
+        elif dep == "ddt":
+            is_set = True
+            ddt_call = 1
+            found = True
+            scope = ""
         else:
             is_set = False
             found  = False
@@ -3631,6 +3733,8 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, do_war
                 for bias in gVariables[vn].biases:
                     if not bias in biases:
                         biases.append(bias)
+                if ddt_call < gVariables[vn].ddt_use:
+                    ddt_call = gVariables[vn].ddt_use
                 assign = gVariables[vn].assign
                 if assign >= 0:
                     is_set = True
@@ -3689,7 +3793,9 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, do_war
                 warning("%s hierarchical system parameter '%s'" % (unset_message, dep))
             else:
                 error("%s %s, which has not been set" % (unset_message, dep))
-    return [bias_dep, biases]
+    if ddt_call and no_ddt:
+        error("%s argument involving ddt()" % unset_message)
+    return [bias_dep, biases, ddt_call]
 # end of checkDependencies
 
 
@@ -3849,7 +3955,7 @@ def reformatConditions( conds ):
         return cond
 
 
-def markVariableAsSet( varname, bias_dep_in, cond_in, biases_in, for_var, set_by_func, fname, argnum ):
+def markVariableAsSet( varname, bias_dep_in, cond_in, biases_in, ddt_in, for_var, set_by_func, fname, argnum ):
     global gLineNo
 
     found = False
@@ -3883,6 +3989,10 @@ def markVariableAsSet( varname, bias_dep_in, cond_in, biases_in, for_var, set_by
                     var.conditions = mergeConditions(oldconds, conds)
             if conds == "" or var.bias_dep < bias_dep:
                 var.bias_dep = bias_dep
+            elif bias_dep == 0 and var.bias_dep > 0:
+                if var.prev_assign != [] and var.prev_assign[1] == 0 and \
+                        conds == "NOT(" + var.prev_assign[0] + ")":
+                    var.bias_dep = 0
             if conds == "": # replace previous biases
                 var.biases   = biases
             else: # append these biases, possibly overkill
@@ -3891,6 +4001,13 @@ def markVariableAsSet( varname, bias_dep_in, cond_in, biases_in, for_var, set_by
                         var.biases.append(bias)
             if set_by_func:
                 var.funcNameAndArg = [fname, argnum]
+            if conds == "" or var.ddt_use < ddt_in:
+                var.ddt_use = ddt_in
+            elif ddt_in == 0 and var.ddt_use > 0:
+                if var.prev_assign != [] and var.prev_assign[2] == 0 and \
+                        conds == "NOT(" + var.prev_assign[0] + ")":
+                    var.ddt_use = 0 
+            var.prev_assign = [conds, bias_dep, ddt_in]
             break
         if scope != "":
             scopes = scope.split(".")
@@ -4300,7 +4417,7 @@ def parseOther( line ):
                 deps = []
             else:
                 deps = new_cond.getDependencies(False, False)
-            [bias_dep, biases] = checkDependencies(deps, "If condition depends on", 0, True, True)
+            [bias_dep, biases, ddt] = checkDependencies(deps, "If condition depends on", 0, True, True, True)
             if this_cond.type == "NOTHING":
                 this_cond = new_cond
             elif new_cond.type == "NOTHING":
@@ -4325,7 +4442,7 @@ def parseOther( line ):
                     # TODO: doesn't handle subsequent else
                     new_cond = parser.getExpression(True)
                     deps = new_cond.getDependencies(False, False)
-                    [bias_dep, biases] = checkDependencies(deps, "If condition depends on", 0, True, True)
+                    [bias_dep, biases, ddt] = checkDependencies(deps, "If condition depends on", 0, True, True, True)
                     old_cond = this_cond
                     this_cond = Expression("&&")
                     this_cond.e1 = old_cond
@@ -4371,12 +4488,12 @@ def parseOther( line ):
                     if init_expr.type == "NOTHING":
                         error("Missing initializer value in 'for' loop")
                     elif varname != "":
-                        markVariableAsSet(varname, False, this_cond, [], True, False, "", 0)
+                        markVariableAsSet(varname, False, this_cond, [], 0, True, False, "", 0)
                     if init_expr.type == "NUMBER":
                         pass
                     elif init_expr.type == "NAME":
                         deps = [init_expr.e1]
-                        checkDependencies(deps, "For loop initialization depends on", 0, False, True)
+                        checkDependencies(deps, "For loop initialization depends on", 0, False, True, True)
                     else:
                         # deps = init_expr.getDependencies(False, False)
                         bad_init = True
@@ -4393,7 +4510,7 @@ def parseOther( line ):
             this_cond = parser.getExpression(True)
             if this_cond.type != "NOTHING":
                 deps = this_cond.getDependencies(False, False)
-                [bias_dep, biases] = checkDependencies(deps, "For loop condition depends on", 0, True, True)
+                [bias_dep, biases, ddt] = checkDependencies(deps, "For loop condition depends on", 0, True, True, True)
                 val = parser.lex()
             else:
                 error("Missing condition in 'for' loop")
@@ -4467,7 +4584,7 @@ def parseOther( line ):
         if keywd == "while":
             this_cond = parser.getExpression(True)
             deps = this_cond.getDependencies(False, False)
-            [bias_dep, biases] = checkDependencies(deps, "While condition depends on", 0, True, True)
+            [bias_dep, biases, ddt] = checkDependencies(deps, "While condition depends on", 0, True, True, True)
             this_c_bd = bias_dep
             val = parser.lex()
             if parser.isIdentifier():
@@ -4489,7 +4606,7 @@ def parseOther( line ):
                 vname = scope + name
                 if vname in gVariables:
                     notice("generate statement redeclares variable '%s'" % name)
-                    found = markVariableAsSet(vname, False, this_cond, [], False, False, "", 0)
+                    found = markVariableAsSet(vname, False, this_cond, [], 0, False, False, "", 0)
                 else:
                     var = Variable(vname, "integer", False, gFileName[-1], gLineNo[-1])
                     var.assign = 0 # don't report in summary
@@ -4547,7 +4664,7 @@ def parseOther( line ):
                 if keywd == "if":
                     new_cond = parser.getExpression(True)
                     deps = new_cond.getDependencies(False, False)
-                    [bias_dep, biases] = checkDependencies(deps, "If condition depends on", 0, True, True)
+                    [bias_dep, biases, ddt] = checkDependencies(deps, "If condition depends on", 0, True, True, True)
                     if this_cond.type == "NOTHING":
                         this_cond = new_cond
                     else:
@@ -4576,7 +4693,7 @@ def parseOther( line ):
             var = parser.getExpression()
             if var.type == "NAME":
                 varname = var.e1
-                [bias_dep, biases] = checkDependencies([varname], "Case statement depends on", 0, True, True)
+                [bias_dep, biases, ddt] = checkDependencies([varname], "Case statement depends on", 0, True, True, True)
                 if bias_dep:
                     error("Case statement variable '%s' is bias-dependent" % varname)
                 elif getIdentifierType(varname) != "integer":
@@ -4807,8 +4924,12 @@ def parseOther( line ):
                     gConditions.pop()
                     # ensure RHS values have all been set
                     deps = rhs.getDependencies(True, False)
-                    [bias_dep, biases] = checkDependencies(deps, "Variable %s depends on" % varname, this_c_bd, False, True)
-                    found = markVariableAsSet(varname, bias_dep, this_cond, biases, False, False, "", 0)
+                    [bias_dep, biases, ddt] = checkDependencies(deps, "Variable %s depends on" % varname, this_c_bd, False, False, True)
+                    if ddt:
+                        ddt = rhs.ddtCheck()
+                        if ddt > 1:
+                            error("Assignment to '%s' is nonlinear in ddt()" % varname)
+                    found = markVariableAsSet(varname, bias_dep, this_cond, biases, ddt, False, False, "", 0)
                     if not bias_dep and rhs.type == "+" and (rhs.e1.type == "+" or rhs.e2.type == "+"):
                         # possible binning equation P_i = P + LP*Inv_L + WP*Inv_W + PP*Inv_P
                         t3 = rhs.e2
@@ -4960,10 +5081,18 @@ def parseOther( line ):
                         parser.getChar()
                         rhs = parser.getExpression()
                         deps = rhs.getDependencies(False, False)
-                        [bias_dep, biases] = checkDependencies(deps, "Branch contribution depends on", this_c_bd, False, True)
+                        [bias_dep, biases, ddt] = checkDependencies(deps, "Branch contribution depends on", this_c_bd, False, False, True)
+                        if ddt:
+                            ddt = rhs.ddtCheck()
+                            if ddt > 1:
+                                acc_ref = acc + "(" + nname1
+                                if nname2 != "":
+                                    acc_ref = acc_ref + "," + nname2
+                                acc_ref = acc_ref + ")"
+                                error("Contribution to '%s' is nonlinear in ddt()" % acc_ref)
                         # check dependencies again, but ignore bias_dep in _noise calls
                         deps = rhs.getDependencies(False, True)
-                        [bias_dep, biases] = checkDependencies(deps, "Branch contribution depends on", this_c_bd, False, False)
+                        [bias_dep, biases, ddt] = checkDependencies(deps, "Branch contribution depends on", this_c_bd, False, False, False)
                         if bias_dep == 4:
                             error("Branch contribution depends on quantity obtained from ddx (requires second derivatives)")
                         elif bias_dep >= 3:
@@ -4971,7 +5100,11 @@ def parseOther( line ):
                     elif val == ord(':'):
                         indirect = parser.getExpression()
                         deps = indirect.getDependencies(False, False)
-                        [bias_dep, biases] = checkDependencies(deps, "Indirect branch contribution depends on", this_c_bd, False, True)
+                        [bias_dep, biases, ddt] = checkDependencies(deps, "Indirect branch contribution depends on", this_c_bd, False, False, True)
+                        if ddt:
+                            ddt = indirect.ddtCheck()
+                            if ddt > 1:
+                                error("Indirect branch contribution is nonlinear in ddt()")
                         invalid = False
                         if indirect.type == "==" and indirect.e1.type == "FUNCCALL":
                             fname = indirect.e1.e1
@@ -5020,7 +5153,7 @@ def parseOther( line ):
                         deps = []
                         for arg in args:
                             deps += arg.getDependencies(False, False)
-                        checkDependencies(deps, "Task %s references" % keywd, this_c_bd, False, True)
+                        checkDependencies(deps, "Task %s references" % keywd, this_c_bd, False, False, True)
                         val = parser.lex()
                         if val == ord(')'):
                             val = parser.lex()
