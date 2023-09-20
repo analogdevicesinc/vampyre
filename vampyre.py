@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.1, 28-July-2020
+# version 1.2, 6-Aug-2020
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -18,6 +18,7 @@
 #   - use of lower-case identifiers
 #   - proper use of tref and dtemp
 #   - proper use of the multiplicity attribute
+#12) misuse of limexp
 #
 # Copyright (c) 2020 Analog Devices, Inc.
 # 
@@ -141,7 +142,7 @@ gVAMScompdir = [
     "unconnected_drive", "undef"]
 
 # math functions and number of arguments
-gMathFunctions = { "abs": 1, "log": 1, "$log10":1, "min": 2, "max": 2 }
+gMathFunctions = { "abs": 1, "limexp": 1, "log": 1, "$log10":1, "min": 2, "max": 2 }
 # math functions with both name and $name form
 for fn in ["acos", "acosh", "asin", "asinh", "atan", "atanh", "ceil",
            "cos", "cosh", "exp", "floor", "ln", "sin", "sinh", "sqrt",
@@ -324,6 +325,14 @@ class Expression:
                     error("Invalid argument '%s' to %s, must be a parameter" % (nname, self.e1))
             else:
                 error("Incorrect number of arguments to %s" % self.e1)
+        elif self.e1 == "limexp":
+            if len(self.args) == 1:
+                arg = self.args[0]
+                deps = arg.getDependencies(assign_context, branch_contrib)
+                [bias_dep, biases] = checkDependencies(deps, "Call to function '%s' depends on" % self.e1, 0, False, False)
+                if not bias_dep:
+                    warning("Call to %s(%s), but argument is not bias-dependent" % (self.e1, arg.asString()))
+            # else: warning issued elsewhere
         elif self.e1 == "$limit":
             if len(self.args) == 0:
                 error("Require at least one argument to %s" % self.e1)
@@ -1683,9 +1692,14 @@ def checkIdentifierCollisions( basename, name, escaped, type ):
 
 def getAttributes( line ):
     retval = []
+    do_append = True
     start = line.find("(*")
     while start >= 0:
         stop = line.find("*)")
+        semi = line.find(";")
+        if semi >= 0 and semi < start:
+            do_append = False
+            error("Attribute found after ';', please add line break")
         if stop > start:
             attrib = line[start+2:stop]
             attrib = attrib.strip()
@@ -1699,7 +1713,8 @@ def getAttributes( line ):
                 while i < len(attrib) and (attrib[i].isalpha() or attrib[i] == '_'):
                     name += attrib[i]
                     i += 1
-                retval.append(name)
+                if do_append:
+                    retval.append(name)
                 while i < len(attrib) and attrib[i].isspace():
                     i += 1
                 value = ""
@@ -1717,7 +1732,8 @@ def getAttributes( line ):
                     value = value.strip()
                 # else:
                 #     (* name *)
-                retval.append(value)
+                if do_append:
+                    retval.append(value)
                 if i < len(attrib):
                     if attrib[i] == ',':
                         i += 1
@@ -1770,8 +1786,11 @@ def parseMacro( line ):
                         i += 1
                     else:
                         error("Missing ')' for macro definition")
-                while i < max and line[i].isspace():
-                    i += 1
+                j = i
+                while j < max and line[j].isspace():
+                    if line[j] == '\r' or line[j] == '\n':
+                        i = j+1
+                    j += 1
             if i < max:
                 value = line[i:]
             else:
@@ -1905,7 +1924,7 @@ def expandMacro( line ):
         if name in gMacros:
             text = gMacros[name].text
             args = gMacros[name].args
-            if i < len(line) and line[i] == '(':
+            if i < len(line) and line[i] == '(' and len(args) > 0:
                 nparens = 1
                 i += 1
                 in_quote = False
@@ -1953,6 +1972,43 @@ def expandMacro( line ):
             str += text
             str += line[i:]
             line = str
+        elif name in ["ifdef", "ifndef"]:
+            ts = i
+            while line[ts].isspace():
+                ts += 1
+            te = ts + 1
+            while te < len(line) and not line[te].isspace():
+                te += 1
+            token = line[ts:te]
+            t1 = line.find("`else")
+            t2 = line.find("`endif")
+            if t2 < 0: # pragma: no cover
+                fatal("Found `%s in macro text without corresponding `endif" % name)
+            else:
+                i = t2 + 6
+            rest = line[te:t2]
+            if rest.find("`ifdef") > 0 or rest.find("`ifndef") > 0: # pragma: no cover
+                fatal("Found nested `ifdef in macro text, not supported")
+            if t1 >= 0:
+                def_text = line[te:t1]
+                not_text = line[t1+5:t2]
+            else:
+                def_text = line[te:t2]
+                not_text = ""
+            ifdef_text = ""
+            if (token in gMacros and name == "ifdef") or (token not in gMacros and name == "ifndef"):
+                ifdef_text = def_text
+            else:
+                ifdef_text = not_text
+            str = line[0:pos]
+            str += ifdef_text
+            str += line[i:]
+            line = str
+        elif name in ["else", "endif"]: # pragma: no cover
+            fatal("Found `%s in macro text without corresponding `ifdef" % name)
+        elif name in gVAMScompdir:
+            error("Can't handle compiler directive `%s in macro text" % name)
+            start = i
         else:
             error("Undefined macro `%s" % name)
             start = i
@@ -1975,7 +2031,7 @@ def verifyEndScope( what ):
         gScopeList.pop()
     elif len(gScopeList) == 0:
         error("Found '%s' without corresponding '%s'" % (endname, what))
-    else:
+    else: # pragma: no cover
         scope = getCurrentScope()
         error("Unexpected '%s' while still in scope %s" % (endname, scope))
 
@@ -2248,6 +2304,10 @@ def parseFunction( line ):
     if parser.isIdentifier():
         fname = parser.getString()
         escaped = parser.isEscaped()
+    elif val == ord(';'):
+        fname = ftype
+        ftype = "real"
+        warning("Function type not specified for '%s', assuming real" % fname)
 
     if len(gScopeList) == 0:
         error("Functions may not be defined outside a module")
@@ -2281,7 +2341,7 @@ def parseParamDecl( line, attribs ):
     val = parser.lex()
     if parser.isIdentifier():
         parm_or_alias = parser.getString()
-    if parm_or_alias != "parameter" and parm_or_alias != "aliasparam": # pragma: no cover
+    if parm_or_alias != "parameter" and parm_or_alias != "aliasparam" and parm_or_alias != "localparam": # pragma: no cover
         fatal("Parse error looking for 'parameter'")
 
     inst = False
@@ -2295,14 +2355,14 @@ def parseParamDecl( line, attribs ):
                     inst = True
 
     ptype = ""
-    if parm_or_alias == "parameter":
+    if parm_or_alias == "aliasparam":
+        ptype = "alias"
+    else:
         val = parser.lex()
         if parser.isIdentifier():
             ptype = parser.getString()
         else: # pragma: no cover
             fatal("Parse error looking for parameter type")
-    else:
-        ptype = "alias"
 
     pname = ""
     escaped = False
@@ -2330,10 +2390,7 @@ def parseParamDecl( line, attribs ):
     if len(gScopeList) == 0:
         error("Parameter declared outside of module")
         in_module = False
-    if parm_or_alias == "parameter":
-        if not ptype in ["real", "integer", "string"]:
-            error("Invalid type '%s' for parameter '%s'" % (ptype, pname))
-    else:
+    if parm_or_alias == "aliasparam":
         if parser.isIdentifier():
             if pname in ["real", "integer", "string"]:
                 ptype = pname
@@ -2342,6 +2399,9 @@ def parseParamDecl( line, attribs ):
             elif ptype != "":
                 error("Parse error for aliasparam %s" % ptype)
             val = parser.lex()
+    else:
+        if not ptype in ["real", "integer", "string"]:
+            error("Invalid type '%s' for parameter '%s'" % (ptype, pname))
 
     if pname != "":
         valid = checkIdentifierCollisions(pname, pname, escaped, "Parameter")
@@ -2533,6 +2593,10 @@ def parseVariableDecl( line, attribs ):
             val = parser.lex()
         elif val == ord(';'):
             vtype = ""
+            # clear info from attributes
+            oppt = False
+            units = ""
+            multi = ""
             val = parser.lex()
         elif parser.isIdentifier():
             str = parser.getString()
@@ -2746,6 +2810,8 @@ def checkParmsAndVars():
     temp = gVariables["$temperature"]
     has_tref = False
     has_dtemp = False
+    all_lower = []
+    all_upper = []
     not_lower = []
     not_upper = []
     param_names_lower = []
@@ -2754,10 +2820,18 @@ def checkParmsAndVars():
         gLineNo.append(par.declare[1])
         if not par.used:
             warning("Parameter '%s' was never used" % par.name)
-        if par.name.lower() == "tref":
+        if par.name.lower() in ["tref", "tnom"]:
             has_tref = True
-        elif par.name.lower() == "tnom":
-            has_tref = True
+            if par.is_alias:
+                defv = par.defv
+                if defv.type == "NAME":
+                    defv = defv.e1
+                    if defv in gParameters:
+                        par2 = gParameters[defv]
+                        if par2.inst:
+                            warning("Reference temperature parameter '%s' (aliased as %s) should not be an instance parameter" % (par2.name, par.name))
+            elif par.inst:
+                warning("Reference temperature parameter '%s' should not be an instance parameter" % par.name)
         if par.name.lower() in ["dtemp", "trise"]:
             has_dtemp = True
             if par.is_alias:
@@ -2771,9 +2845,13 @@ def checkParmsAndVars():
             elif not par.inst:
                 warning("Temperature offset parameter '%s' should be an instance parameter" % par.name)
         param_names_lower.append(par.name.lower())
-        if par.name.lower() != par.name:
+        if par.name.lower() == par.name:
+            all_lower.append(par.name)
+        else:
             not_lower.append(par.name)
-        if par.name.upper() != par.name:
+        if par.name.upper() == par.name:
+            all_upper.append(par.name)
+        else:
             not_upper.append(par.name)
         gLineNo.pop()
         gFileName.pop()
@@ -2787,10 +2865,10 @@ def checkParmsAndVars():
             if gStyle:
                 style("Parameters should be declared in lower-case")
         else:
-            if len(not_lower) == 1 and len(not_upper) > 5:
+            if len(not_lower) == 1 and len(all_lower) > 5:
                 bad = not_lower[0]
                 warning("Parameters have inconsistent case (all lower-case except '%s')" % bad)
-            elif len(not_upper) == 1 and len(not_lower) > 5:
+            elif len(not_upper) == 1 and len(all_upper) > 5:
                 bad = not_upper[0]
                 warning("Parameters have inconsistent case (all upper-case except '%s')" % bad)
             else:
@@ -2924,21 +3002,33 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, do_war
                         scope += sc + "."
             else:
                 break
-        if not found and dep in gParameters:
-            if gParameters[dep].is_alias:
-                par = gParameters[dep].defv.e1
-                if par in gParameters:
-                    error("Reference to aliasparam '%s' should use parameter '%s'" % (dep,par))
-                else:
-                    error("Reference to aliasparam '%s'" % dep)
-            gParameters[dep].used = True
-            is_set = True
-        if dep in gPortnames or dep in gNodenames and do_warn:
-            error("Reference to node '%s' without access function" % dep)
-        elif dep in gBranches and do_warn:
-            error("Reference to branch '%s' without access function" % dep)
-        elif not is_set and do_warn:
-            error("%s %s, which has not been set" % (unset_message, dep))
+        if not found:
+            if dep in gParameters:
+                if gParameters[dep].is_alias:
+                    par = gParameters[dep].defv.e1
+                    if par in gParameters:
+                        error("Reference to aliasparam '%s' should use parameter '%s'" % (dep,par))
+                    else:
+                        error("Reference to aliasparam '%s'" % dep)
+                gParameters[dep].used = True
+                is_set = True
+            elif dep in gPortnames or dep in gNodenames:
+                if bias_dep == 0:
+                    bias_dep = 1
+                if do_warn:
+                    error("Reference to node '%s' without access function" % dep)
+                is_set = True
+            elif dep in gBranches:
+                if bias_dep == 0:
+                    bias_dep = 1
+                if do_warn:
+                    error("Reference to branch '%s' without access function" % dep)
+                is_set = True
+        if not is_set and do_warn:
+            if dep in gVAMSkeywords:
+                error("%s Verilog-AMS keyword '%s'" % (unset_message, dep))
+            else:
+                error("%s %s, which has not been set" % (unset_message, dep))
     return [bias_dep, biases]
 # end of checkDependencies
 
@@ -3719,7 +3809,7 @@ def parseOther( line ):
 
         elif keywd in ["supply0", "supply1", "tri", "triand", "trior", "tri0", "tri1", \
                        "uwire", "wire", "wand", "wor", "trireg", "wreal", \
-                       "realtime", "reg", "time", "specparam", "localparam"]: # pragma: no cover
+                       "realtime", "reg", "time", "specparam"]: # pragma: no cover
             error("Unsupported declaration: '%s'" % keywd)
 
         else:
@@ -4185,6 +4275,7 @@ def preProcessNatures( lines ):
 def parseLines( lines ):
     global gScopeList, gLineNo
     global gStatementInCurrentBlock
+    prev_attribs = []
 
     j = 0
     while j < len(lines):
@@ -4208,8 +4299,19 @@ def parseLines( lines ):
                 continue
             retarray = getAttributes(part)
             part = retarray[0]
-            attribs = retarray[1:]
-
+            attribs = prev_attribs + retarray[1:]
+            if part == "":
+                if i < len(parts):
+                    part = parts[i]
+                    i += 1
+                    retarray = getAttributes(part)
+                    part = retarray[0]
+                    attribs.append(retarray[1:])
+                else:
+                    prev_attribs = attribs
+                    continue
+            elif part[-1] == ';':
+                prev_attribs = []
 
             # natures and disciplines
             #
@@ -4287,7 +4389,10 @@ def parseLines( lines ):
                                 elif not var.used and not var.assign == 0:
                                     warning("In function %s, variable '%s' was never used" % (fname,vn))
                         if not func_assign:
-                            error("Function '%s' is not assigned a return value" % gCurrentFunction.name)
+                            if len(gCurrentFunction.outputs) > 0:
+                                warning("Function '%s' is not assigned a return value" % gCurrentFunction.name)
+                            else:
+                                error("Function '%s' is not assigned a return value" % gCurrentFunction.name)
                     else: # pragma: no cover
                         fatal("Programming error: no current function")
                     gScopeList.pop()
@@ -4299,7 +4404,8 @@ def parseLines( lines ):
 
             # parameters, variables, ports
             #
-            elif part.startswith("parameter") or part.startswith("aliasparam"):
+            elif part.startswith("parameter") or part.startswith("aliasparam") or part.startswith("localparam") or \
+                    (part.startswith("real") and part[4].isspace()) or (part.startswith("integer") and part[7].isspace()):
                 if part[-1] != ';' and i >= len(parts):
                     tmpline = part
                     tmpj = j
@@ -4317,9 +4423,10 @@ def parseLines( lines ):
                         part = tmpline
                         j = tmpj
                         gLineNo[-1] = j
-                parseParamDecl(part, attribs)
-            elif part.startswith("real") or part.startswith("integer"):
-                parseVariableDecl(part, attribs)
+                if part.startswith("parameter") or part.startswith("aliasparam") or part.startswith("localparam"):
+                    parseParamDecl(part, attribs)
+                else:
+                    parseVariableDecl(part, attribs)
             elif part.startswith("inout") or part.startswith("input") or part.startswith("output"):
                 parsePortDirection(part)
 
@@ -4487,6 +4594,9 @@ def parseFile( filename ):
     indent_inside_ifdef = -1
     first_inside_ifdef = -1
     indent_multiline_define = -1
+    indent_define = -1
+    first_define_indent = -1
+    special_define_indent = 0
     indent_this_define = -1
     first_multiline_define = -1
     in_multiline_define = False
@@ -4527,6 +4637,11 @@ def parseFile( filename ):
                 in_comment = retval[1]
             else:
                 line = ""
+            if gFixIndent:
+                fixed_line = orig_line.rstrip() + "\n"
+                fixedLines.append(fixed_line)
+                if fixed_line != orig_line:
+                    did_fix = True
         else:
             if line.find("//") >= 0 or line.find("/*") >= 0:
                 retval = removeComments(line, in_comment)
@@ -4581,6 +4696,8 @@ def parseFile( filename ):
                         if (indent_ifdef != 0 and stripped.startswith("`else")) or \
                                (indent_ifdef == -1 and stripped.startswith("`endif")):
                             this_indent -= gSpcPerInd
+                    elif in_multiline_define:
+                        this_indent += special_define_indent
                     previous_single_indent = single_line_indent
                     if single_line_indent > 0:
                         if keywd != "begin":
@@ -4705,6 +4822,19 @@ def parseFile( filename ):
                                 if gFixIndent and indent > this_indent:
                                     fixed_line = makeIndent(this_indent) + fixed_line.strip() + "\n"
                             if keywd == "define":
+                                if required_indent > 0:
+                                    if indent == 0:
+                                        if indent_define == -1:
+                                            indent_define = 0
+                                            first_define_indent = gLineNo[-1]
+                                        elif indent_define != 0:
+                                            style("Inconsistent indentation of `define (compare with line %d)" % first_define_indent )
+                                    else:
+                                        if indent_define == -1:
+                                            indent_define = 1
+                                            first_define_indent = gLineNo[-1]
+                                        elif indent_define != 1:
+                                            style("Inconsistent indentation of `define (compare with line %d)" % first_define_indent )
                                 if indent != 0 and indent != required_indent:
                                     if required_indent != 0:
                                         style("Incorrect indent: %d, should be %d (or 0)" % (indent, required_indent), "Incorrect indent")
@@ -4714,6 +4844,10 @@ def parseFile( filename ):
                                     optional_indent = gSpcPerInd
                                     optional_indent_reason = "define"
                                     in_multiline_define = True
+                                    if indent == 0 and indent != required_indent:
+                                        special_define_indent = indent - required_indent
+                                    else:
+                                        special_define_indent = 0
                             elif keywd == "ifdef" or keywd == "ifndef":
                                 # optional indent inside ifdef
                                 if indent_inside_ifdef == 1:
@@ -4803,7 +4937,7 @@ def parseFile( filename ):
                     if continued_line == "no_semicolon":
                         if stripped != "" and stripped[-1] == ';':
                             continued_line = ""
-                    elif continued_line == "parens":
+                    elif continued_line == "parentheses":
                         for ch in line:
                             if ch == '(':
                                 unclosed_parens += 1
@@ -4898,7 +5032,7 @@ class versionAction(argparse.Action):
         return
     def __call__(self, parser, namespace, values, option_string=None):
         print("""
-VAMPyRE version 1.1
+VAMPyRE version 1.2
 """)
         sys.exit()
 
@@ -4907,7 +5041,7 @@ VAMPyRE version 1.1
 #   Process command line arguments
 #
 
-parser =argparse.ArgumentParser(description='Parse and sun basic checks on Verilog-A models')
+parser = argparse.ArgumentParser(description='Parse and run basic checks on Verilog-A models')
 parser.add_argument('main_file',             help='name of top-level Verilog-A file')
 parser.add_argument('-a', '--all',           help='equivalent to --max_num 0', action='store_true')
 parser.add_argument('-d', '--debug',         help='turn on debug mode', action='store_true')
