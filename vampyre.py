@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.8.7, 09-Mar-2022
+# version 1.8.8, 1-Sept-2022
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -49,7 +49,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.8.7"
+gVersionNumber = "1.8.8"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -466,7 +466,7 @@ class Expression:
                 for i in range(len(self.args)):
                     if i in out_arg_pos:
                         arg = self.args[i]
-                        markVariableAsSet(arg.e1, bias_dep, Expression("NOTHING"), biases, 0, False, True, self.e1, i)
+                        markVariableAsSet(arg.e1, None, bias_dep, Expression("NOTHING"), biases, 0, False, True, self.e1, i)
         return deps
 
     elif self.type in ["!", "~"]:
@@ -579,7 +579,9 @@ class Expression:
     if self.type == "NAME" or self.type == "STRING":
         return self.e1
     elif self.type == "NUMBER":
-        if self.is_int:
+        if isinstance(self.e1,str): # original parsed string
+            return self.e1
+        elif self.is_int:
             return str(int(self.number))
         else:
             return str(self.number)
@@ -793,7 +795,7 @@ class Parser:
             str += self.getChar()
             is_int = False
 
-    return [value, is_int]
+    return [value, is_int, str]
   # end of lexNumber
 
   def lexName(self):
@@ -830,7 +832,8 @@ class Parser:
         number = self.lexNumber()
         self.number = number[0]
         self.is_int = number[1]
-        self.token = TOKEN_NUMBER
+        self.string = number[2]
+        self.token  = TOKEN_NUMBER
     elif ch.isalpha() or ch == '_' or ch == '$':
         self.string = self.lexName()
         self.token = TOKEN_IDENTIFIER
@@ -1014,6 +1017,7 @@ class Parser:
         expr = Expression("NUMBER")
         expr.number = self.getNumber()
         expr.is_int = self.is_int
+        expr.e1     = self.getString()
     elif self.isString():
         expr = Expression("STRING")
         expr.e1 = self.getString()
@@ -1057,8 +1061,7 @@ class Parser:
     else:
         self.ungetChar(chr(val))
         expr = Expression("NOTHING")
-    while self.peekChar().isspace():
-        self.getChar()
+    self.eatSpace()
     return expr
 
   def parsePostfix(self, is_cond):
@@ -1069,6 +1072,7 @@ class Parser:
             self.getChar()
             fname = expr.e1
             is_port_flow = False
+            self.eatSpace()
             ch = self.peekChar()
             if fname in gAccessFuncs and ch == '<':
                 self.getChar()
@@ -1182,6 +1186,7 @@ class Parser:
                     error("Incorrect number of arguments (%d) for function %s (expect 1 or 2)"
                           % (len(args), fname))
 
+            self.eatSpace()
             if self.peekChar() == ')':
                 self.getChar()
                 self.eatSpace()
@@ -1232,6 +1237,9 @@ class Parser:
         if arg.type == "NUMBER":
             expr = Expression("NUMBER")
             expr.number = -arg.number
+            expr.is_int = arg.is_int
+            if isinstance(arg.e1,str) and do_warn == "":
+                expr.e1 = oper + arg.e1
         else:
             expr = Expression(oper)
             expr.e1 = arg
@@ -2940,10 +2948,11 @@ def printModuleSummary():
         InstParms = {}
         ModelParms = {}
         for (k,p) in gParameters.items():
-            if p.inst:
-                InstParms[k] = p
-            if p.model: # can be both model and inst
-                ModelParms[k] = p
+            if not p.is_alias:
+                if p.inst:
+                    InstParms[k] = p
+                if p.model: # can be both model and inst
+                    ModelParms[k] = p
         if len(InstParms):
             if gVerbose or len(InstParms) < 20:
                 print("\nInstance parameters (%d):" % len(InstParms))
@@ -2952,7 +2961,10 @@ def printModuleSummary():
                 print("\nInstance parameters (%d)" % len(InstParms))
             if gPrDefVals:
                 printParamDefaults(InstParms)
-            if gVerbose or len(ModelParms) < 20:
+            if len(ModelParms) == 0:
+                if gVerbose:
+                    print("\nNo model parameters")
+            elif gVerbose or len(ModelParms) < 20:
                 print("\nModel parameters (%d):" % len(ModelParms))
                 print_list(ModelParms.keys(), "    ", 70)
             else:
@@ -2988,7 +3000,7 @@ def printModuleSummary():
         elif len(gVariables):
             print("\nNo operating-point variables")
         if gVerbose:
-            print("Variables (%d):" % len(gVariables))
+            print("\nVariables (%d):" % len(gVariables))
             print_list(gVariables.keys(), "    ", 70)
 
     if len(gHiddenState):
@@ -3494,6 +3506,9 @@ def parsePortDirection( line ):
                     # input x; real x; OK for functions
                     if gStyle and (len(gScopeList) == 0 or not gScopeList[-1].startswith("FUNCTION::")):
                         style("Variable declaration on same line as port declaration")
+                elif ptype in gDisciplines:
+                    # inout a; electrical a;
+                    pass
                 else:
                     error("Invalid port direction '%s', expect 'inout'" % ptype)
                 val = parser.lex()
@@ -3550,14 +3565,30 @@ def parsePortDirection( line ):
                 # set direction in global map
                 if valid and in_module:
                     port = gPortnames[pname]
-                    if port.direction != "":
-                        error("Port (terminal) '%s' already had direction '%s'" % (pname, port.direction))
+                    if ptype in ["inout", "input", "output"]:
+                        if port.direction != "":
+                            error("Port (terminal) '%s' already had direction '%s'" % (pname, port.direction))
+                        else:
+                            port.direction = ptype
+                        if len(bus_range) == 2:
+                            port.is_bus = True
+                            port.msb = bus_range[0]
+                            port.lsb = bus_range[1]
+                    elif ptype in gDisciplines:
+                        if port.discipline != "":
+                            error("Duplicate specification of discipline for port (terminal) '%s'" % pname)
+                        port.discipline = ptype
+                        if bus_range != []:
+                            if port.is_bus:
+                                if port.msb != bus_range[0] or port.lsb != bus_range[1]:
+                                    error("Port '%s' has different bus ranges in port and discipline declarations" % pname)
+                            elif port.direction != "":
+                                error("Discipline declaration for scalar port '%s' has bus range [%d:%d]" % (pname, bus_range[0], bus_range[1]))
+                            # else have not seen direction declaration
+                        elif port.is_bus:
+                            error("Discipline declaration for port '%s' should also have bus range [%d:%d]" % (pname, port.msb, port.lsb))
                     else:
-                        port.direction = ptype
-                    if len(bus_range) == 2:
-                        port.is_bus = True
-                        port.msb = bus_range[0]
-                        port.lsb = bus_range[1]
+                        error("Unexpected identifier '%s' in port declaration" % ptype)
             val = parser.lex()
         elif parser.isNumber():
             num = parser.getNumber()
@@ -4096,7 +4127,7 @@ def reformatConditions( conds ):
         return cond
 
 
-def markVariableAsSet( varname, bias_dep_in, cond_in, biases_in, ddt_in, for_var, set_by_func, fname, argnum ):
+def markVariableAsSet( varname, rhs, bias_dep_in, cond_in, biases_in, ddt_in, for_var, set_by_func, fname, argnum ):
     global gLineNo
 
     found = False
@@ -4112,6 +4143,11 @@ def markVariableAsSet( varname, bias_dep_in, cond_in, biases_in, ddt_in, for_var
                 if bias_dep > 1:
                     bias_dep = 1
                     biases = []
+                if rhs and rhs.type == "NUMBER" and rhs.is_int == 0:
+                    warning("Integer variable '%s' assigned a real value %s" % (varname, rhs.asString()))
+            elif var.type == "real" and rhs:
+                if rhs.type in ["<", ">", "<=", ">=", "==", "!=", "&&", "||"]:
+                    warning("Real variable '%s' assigned a boolean (result of %s)" % (varname, rhs.type))
             if var.assign < 0:
                 # first assignment
                 var.assign = gLineNo[-1]
@@ -4629,7 +4665,7 @@ def parseOther( line ):
                     if init_expr.type == "NOTHING":
                         error("Missing initializer value in 'for' loop")
                     elif varname != "":
-                        markVariableAsSet(varname, False, this_cond, [], 0, True, False, "", 0)
+                        markVariableAsSet(varname, None, False, this_cond, [], 0, True, False, "", 0)
                     if init_expr.type == "NUMBER":
                         pass
                     elif init_expr.type == "NAME":
@@ -4747,7 +4783,7 @@ def parseOther( line ):
                 vname = scope + name
                 if vname in gVariables:
                     notice("generate statement redeclares variable '%s'" % name)
-                    found = markVariableAsSet(vname, False, this_cond, [], 0, False, False, "", 0)
+                    found = markVariableAsSet(vname, None, False, this_cond, [], 0, False, False, "", 0)
                 else:
                     var = Variable(vname, "integer", False, gFileName[-1], gLineNo[-1])
                     var.assign = 0 # don't report in summary
@@ -5070,7 +5106,7 @@ def parseOther( line ):
                         ddt = rhs.ddtCheck()
                         if ddt > 1:
                             error("Assignment to '%s' is nonlinear in ddt()" % varname)
-                    found = markVariableAsSet(varname, bias_dep, this_cond, biases, ddt, False, False, "", 0)
+                    found = markVariableAsSet(varname, rhs, bias_dep, this_cond, biases, ddt, False, False, "", 0)
                     if not bias_dep and rhs.type == "+" and (rhs.e1.type == "+" or rhs.e2.type == "+"):
                         # possible binning equation P_i = P + LP*Inv_L + WP*Inv_W + PP*Inv_P
                         t3 = rhs.e2
@@ -5124,6 +5160,8 @@ def parseOther( line ):
                             parser.ungetChars("if")
                             if gStyle:
                                 style("Multiple statements on a single line")
+                        elif keywd == "end" and parser.peekRestOfLine().strip() == "":
+                            pass
                         elif gStyle and not all_zero_assigns:
                             style("Multiple assignments on a single line")
                         if parser.peekChar() == '[':
@@ -5865,7 +5903,9 @@ def parseLines( lines ):
                                 num_parens += 1
                             elif ch == ')':
                                 num_parens -= 1
-                        if num_parens > 0 or tmpline[-1] in ["+", "-", "*", "/"]:
+                        nextln = lines[tmpj].strip()
+                        if num_parens > 0 or tmpline[-1] in "+-*/%><!&|=~^?" or \
+                                (nextln != "" and nextln[0] in "+-*/%><!&|=~^?"):
                             nextln = lines[tmpj]
                             nextln = handleCompilerDirectives(nextln)
                             tmpline += " " + nextln
@@ -6134,6 +6174,10 @@ def parseFile( filename ):
                         #orig_line = orig_line[:-2] + "\n"
                         if stripped.endswith("\\"):
                             stripped = stripped[:-1].strip()
+                        if len(orig_line) > 2 and orig_line[-3] != ' ':
+                            style("Prefer space before \\")
+                            if gFixIndent:
+                                fixed_line = fixed_line[:-2] + " \\\n"
                     parser = Parser(line)
                     val = parser.lex()
                     bad_indent = False
@@ -6248,6 +6292,124 @@ def parseFile( filename ):
                         optional_indent_reason = ""
 
                     may_be_assign_or_contrib = 0
+                    if val == ord('`'):
+                        val = parser.lex()
+                        if parser.isIdentifier():
+                            token = parser.getString()
+                            if token in gVAMScompdir:
+                                bad_indent = False
+                                is_vams_compdir = True
+                                if gFixIndent and indent > this_indent:
+                                    fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
+                            if token == "define":
+                                indent_before_define = required_indent
+                                if required_indent > 0:
+                                    if indent == 0:
+                                        if indent_define == -1:
+                                            indent_define = 0
+                                            first_define_indent = gLineNo[-1]
+                                        elif indent_define != 0:
+                                            style("Inconsistent indentation of `define (compare with line %d)" % first_define_indent )
+                                            if gFixIndent:
+                                                fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
+                                    else:
+                                        if indent_define == -1:
+                                            indent_define = 1
+                                            first_define_indent = gLineNo[-1]
+                                        elif indent_define != 1:
+                                            style("Inconsistent indentation of `define (compare with line %d)" % first_define_indent )
+                                            if gFixIndent:
+                                                fixed_line = fixed_line.strip() + "\n"
+                                if indent != 0 and indent != required_indent:
+                                    if required_indent != 0:
+                                        style("Incorrect indent: %d, should be %d (or 0)" % (indent, required_indent), "Incorrect indent")
+                                    else:
+                                        style("Incorrect indent: %d, should be 0" % indent, "Incorrect indent")
+                                if line[-2] == '\\':
+                                    optional_indent = gSpcPerInd
+                                    optional_indent_reason = "define"
+                                    in_multiline_define = True
+                                    if indent == 0 and indent != required_indent:
+                                        special_define_indent = indent - required_indent
+                                    else:
+                                        special_define_indent = 0
+                            elif token == "ifdef" or token == "ifndef":
+                                # optional indent inside ifdef
+                                if indent_inside_ifdef == 1:
+                                    required_indent += gSpcPerInd
+                                else:
+                                    optional_indent += gSpcPerInd
+                                    optional_indent_reason = "ifdef"
+                                ifdef_depth += 1
+                                indents_in_ifdefs.append([required_indent, -1])
+                                if indent_ifdef == -1:
+                                    # first encounter
+                                    if this_indent > 0:
+                                        if indent == 0:
+                                            indent_ifdef = 0
+                                            first_ifdef_indent = gLineNo[-1]
+                                            this_indent = 0
+                                        else:
+                                            indent_ifdef = gSpcPerInd
+                                            first_ifdef_indent = gLineNo[-1]
+                                            if indent != this_indent:
+                                                bad_indent = True
+                                    # if this_indent == 0, can't decide yet
+                                elif (indent_ifdef == 0 and indent != 0) or \
+                                     (indent_ifdef > 0 and indent != this_indent):
+                                    style("Inconsistent indentation for `ifdef (compare with line %d)" % first_ifdef_indent, "Incorrect indent")
+                                if indent_ifdef == 0:
+                                    this_indent = 0
+                                fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
+                            elif token == "else":
+                                if indent_inside_ifdef == -1:
+                                    # only comments in the `ifdef block
+                                    optional_indent += gSpcPerInd
+                                    optional_indent_reason = "ifdef"
+                                if ifdef_depth > 0 and len(indents_in_ifdefs) == ifdef_depth:
+                                    depths = indents_in_ifdefs[ifdef_depth-1]
+                                    depths[1] = required_indent
+                                    if depths[0] != required_indent:
+                                        required_indent = depths[0]
+                                if (indent_ifdef == 0 and indent != 0) or \
+                                        (indent_ifdef > 0 and indent != this_indent):
+                                    bad_indent = True
+                                    if indent_ifdef == 0:
+                                        this_indent = 0
+                            elif token == "endif":
+                                if ifdef_depth > 0:
+                                    if ifdef_depth > 0 and len(indents_in_ifdefs) == ifdef_depth:
+                                        depths = indents_in_ifdefs[ifdef_depth-1]
+                                        if depths[1] == -1: # no `else
+                                            pass # spurious warnings
+                                            #if depths[0] != required_indent:
+                                            #    style("Conditional indent inside `ifdef, but no `else")
+                                        elif depths[1] > required_indent:
+                                            style("Extra indent in `ifdef compared with `else block")
+                                        elif depths[1] < required_indent:
+                                            style("Extra indent in `else compared with `ifdef block")
+                                        indents_in_ifdefs.pop()
+                                        ifdef_depth -= 1
+                                    if indent_inside_ifdef > 0:
+                                        if this_indent >= gSpcPerInd:
+                                            this_indent -= gSpcPerInd
+                                        if required_indent >= gSpcPerInd:
+                                            required_indent -= gSpcPerInd
+                                    elif indent_inside_ifdef == -1:
+                                        optional_indent_reason = ""
+                                    if optional_indent >= gSpcPerInd:
+                                        optional_indent -= gSpcPerInd
+                                # else error reported later
+                                if (indent_ifdef == 0 and indent != 0) or \
+                                        (indent_ifdef > 0 and indent != required_indent):
+                                    bad_indent = True
+                                    if indent_ifdef == 0:
+                                        this_indent = 0
+                            elif not is_vams_compdir:
+                                # `MODEL begin:
+                                val = parser.lex()
+                                if parser.isIdentifier():
+                                    keywd = parser.getString()
                     if keywd != "":
                         if keywd == "module" or keywd == "macromodule":
                             optional_indent = gSpcPerInd
@@ -6298,6 +6460,12 @@ def parseFile( filename ):
                                     single_line_indent = 0
                         else:
                             val = parser.lex()
+                            if val == ord('['):
+                                rest = parser.peekRestOfLine()
+                                if rest.find("]"):
+                                    while val != ord(']'):
+                                        val = parser.lex()
+                                    val = parser.lex()
                             if val == ord('='):
                                 may_be_assign_or_contrib = 1
                             elif val == ord('('):
@@ -6311,119 +6479,6 @@ def parseFile( filename ):
                                 if parser.getString() == "begin":
                                     optional_indent = 0
                                     required_indent += gSpcPerInd
-                    elif val == ord('`'):
-                        val = parser.lex()
-                        if parser.isIdentifier():
-                            keywd = parser.getString()
-                            if keywd in gVAMScompdir:
-                                bad_indent = False
-                                is_vams_compdir = True
-                                if gFixIndent and indent > this_indent:
-                                    fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
-                            if keywd == "define":
-                                indent_before_define = required_indent
-                                if required_indent > 0:
-                                    if indent == 0:
-                                        if indent_define == -1:
-                                            indent_define = 0
-                                            first_define_indent = gLineNo[-1]
-                                        elif indent_define != 0:
-                                            style("Inconsistent indentation of `define (compare with line %d)" % first_define_indent )
-                                            if gFixIndent:
-                                                fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
-                                    else:
-                                        if indent_define == -1:
-                                            indent_define = 1
-                                            first_define_indent = gLineNo[-1]
-                                        elif indent_define != 1:
-                                            style("Inconsistent indentation of `define (compare with line %d)" % first_define_indent )
-                                            if gFixIndent:
-                                                fixed_line = fixed_line.strip() + "\n"
-                                if indent != 0 and indent != required_indent:
-                                    if required_indent != 0:
-                                        style("Incorrect indent: %d, should be %d (or 0)" % (indent, required_indent), "Incorrect indent")
-                                    else:
-                                        style("Incorrect indent: %d, should be 0" % indent, "Incorrect indent")
-                                if line[-2] == '\\':
-                                    optional_indent = gSpcPerInd
-                                    optional_indent_reason = "define"
-                                    in_multiline_define = True
-                                    if indent == 0 and indent != required_indent:
-                                        special_define_indent = indent - required_indent
-                                    else:
-                                        special_define_indent = 0
-                            elif keywd == "ifdef" or keywd == "ifndef":
-                                # optional indent inside ifdef
-                                if indent_inside_ifdef == 1:
-                                    required_indent += gSpcPerInd
-                                else:
-                                    optional_indent += gSpcPerInd
-                                    optional_indent_reason = "ifdef"
-                                ifdef_depth += 1
-                                indents_in_ifdefs.append([required_indent, -1])
-                                if indent_ifdef == -1:
-                                    # first encounter
-                                    if this_indent > 0:
-                                        if indent == 0:
-                                            indent_ifdef = 0
-                                            first_ifdef_indent = gLineNo[-1]
-                                            this_indent = 0
-                                        else:
-                                            indent_ifdef = gSpcPerInd
-                                            first_ifdef_indent = gLineNo[-1]
-                                            if indent != this_indent:
-                                                bad_indent = True
-                                    # if this_indent == 0, can't decide yet
-                                elif (indent_ifdef == 0 and indent != 0) or \
-                                     (indent_ifdef > 0 and indent != this_indent):
-                                    style("Inconsistent indentation for `ifdef (compare with line %d)" % first_ifdef_indent, "Incorrect indent")
-                                if indent_ifdef == 0:
-                                    this_indent = 0
-                                fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
-                            elif keywd == "else":
-                                if indent_inside_ifdef == -1:
-                                    # only comments in the `ifdef block
-                                    optional_indent += gSpcPerInd
-                                    optional_indent_reason = "ifdef"
-                                if ifdef_depth > 0 and len(indents_in_ifdefs) == ifdef_depth:
-                                    depths = indents_in_ifdefs[ifdef_depth-1]
-                                    depths[1] = required_indent
-                                    if depths[0] != required_indent:
-                                        required_indent = depths[0]
-                                if (indent_ifdef == 0 and indent != 0) or \
-                                        (indent_ifdef > 0 and indent != this_indent):
-                                    bad_indent = True
-                                    if indent_ifdef == 0:
-                                        this_indent = 0
-                            elif keywd == "endif":
-                                if ifdef_depth > 0:
-                                    if ifdef_depth > 0 and len(indents_in_ifdefs) == ifdef_depth:
-                                        depths = indents_in_ifdefs[ifdef_depth-1]
-                                        if depths[1] == -1: # no `else
-                                            pass # spurious warnings
-                                            #if depths[0] != required_indent:
-                                            #    style("Conditional indent inside `ifdef, but no `else")
-                                        elif depths[1] > required_indent:
-                                            style("Extra indent in `ifdef compared with `else block")
-                                        elif depths[1] < required_indent:
-                                            style("Extra indent in `else compared with `ifdef block")
-                                        indents_in_ifdefs.pop()
-                                        ifdef_depth -= 1
-                                    if indent_inside_ifdef > 0:
-                                        if this_indent >= gSpcPerInd:
-                                            this_indent -= gSpcPerInd
-                                        if required_indent >= gSpcPerInd:
-                                            required_indent -= gSpcPerInd
-                                    elif indent_inside_ifdef == -1:
-                                        optional_indent_reason = ""
-                                    if optional_indent >= gSpcPerInd:
-                                        optional_indent -= gSpcPerInd
-                                # else error reported later
-                                if (indent_ifdef == 0 and indent != 0) or \
-                                        (indent_ifdef > 0 and indent != required_indent):
-                                    bad_indent = True
-                                    if indent_ifdef == 0:
-                                        this_indent = 0
                     if bad_indent and continued_line != "" and indent > this_indent:
                         bad_indent = False
                     elif indent_this_define == 0 and not is_vams_compdir:
