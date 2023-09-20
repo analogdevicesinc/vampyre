@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.4, 26-Oct-2020
+# version 1.5, 30-Oct-2020
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -20,6 +20,7 @@
 #   - proper use of tref and dtemp
 #   - proper use of the multiplicity attribute
 #12) misuse of limexp
+#13) various problems with binning equations
 #
 # Copyright (c) 2020 Analog Devices, Inc.
 # 
@@ -195,6 +196,7 @@ class Parameter:
     self.type = type         # real, integer, string
     self.declare = [file, line]
     self.defv = 0
+    self.units = 0
     self.range = "nb"        # nb, cc, co, oc, oo, cz, oz, sw
     self.max = float("inf")
     self.min = float("-inf")
@@ -2481,6 +2483,7 @@ def parseParamDecl( line, attribs ):
         fatal("Parse error looking for 'parameter'")
 
     inst = False
+    units = ""
     if len(attribs) > 0:
         for i in range(0, len(attribs)-1, 2):
             if attribs[i] == "type":
@@ -2489,6 +2492,8 @@ def parseParamDecl( line, attribs ):
                     inst = True
                 elif val == "both" or val == "\"both\"":
                     inst = True
+            elif attribs[i] == "units":
+                units = attribs[i+1].strip('"').strip()
 
     ptype = ""
     if parm_or_alias == "aliasparam":
@@ -2520,6 +2525,7 @@ def parseParamDecl( line, attribs ):
 
     parm = Parameter(pname, ptype, gFileName[-1], gLineNo[-1])
     parm.inst = inst
+    parm.units = units
 
     if val != ord('='):
         val = parser.lex()
@@ -2565,6 +2571,31 @@ def parseParamDecl( line, attribs ):
         parm.is_alias = True
 
     else:
+        if parm.defv.type == "NAME" and parm.defv.e1 in gParameters:
+            dparm = gParameters[parm.defv.e1]
+            if dparm.units != units:
+                c1 = units.find("^")
+                p1 = units.find(pname)
+                c2 = dparm.units.find("^")
+                p2 = dparm.units.find(dparm.name)
+                if c1 > 0 and c2 > 0 and p1 > c1 and p2 > c2:
+                    # look for RDDR with units V^(-PRDDR), default RSDR with units V^(-PRSDR)
+                    tmp = units[0:p1] + dparm.name + units[p1+len(dparm.name):]
+                    if tmp == dparm.units:
+                        units = dparm.units
+                elif c2 > 0 and p2 > c2 and pname.find(dparm.name) >= 0 and units.find(dparm.name) >= 0:
+                    # PTWGLR with units m^PTWGLEXPR, PTWGL with units m^PTWGLEXP
+                    units = dparm.units
+            if dparm.units != units:
+                if units == "":
+                    u1 = "no units"
+                else:
+                    u1 = "units '" + units + "'"
+                if dparm.units == "":
+                    u2 = "no units"
+                else:
+                    u2 = "units '" + dparm.units + "'"
+                notice("Parameter '%s' with %s has default '%s' with %s" % (pname, u1, dparm.name, u2))
         deps = parm.defv.getDependencies(False, False)
         for dep in deps:
             if dep == pname:
@@ -2671,9 +2702,9 @@ def parseVariableDecl( line, attribs ):
     checkDeclarationContext("Variable")
 
     oppt = False
+    units = ""
+    multi = ""
     if len(attribs) > 0:
-        units = ""
-        multi = ""
         for i in range(0, len(attribs), 2):
             if attribs[i] == "units":
                 oppt = True
@@ -3491,13 +3522,36 @@ def checkBinningTerm(t_in, pname):
         elif term.e2.type == "NAME" and term.e2.e1 in gParameters:
             sname = term.e2.e1
             fact = term.e1.asString()
+        elif term.e2.type == "NUMBER" and term.e2.e1 == 0.0:
+            # deliberately zero binning term
+            pfx = "0.0"
         if sname != "":
-            if sname[1:] == pname:
-                pfx = sname[0]
+            if sname in gParameters:
+                spar = gParameters[sname]
+                if spar.defv:
+                    if spar.defv.type == "NUMBER":
+                        if spar.defv.e1 != 0:
+                            warning("Non-zero default value (%e) for binning parameter '%s'" % (spar.defv.e1, sname))
+                    elif spar.defv.type == "NAME" and spar.defv.e1 in gParameters:
+                        dpar = gParameters[spar.defv.e1]
+                        if sname[0] != dpar.name[0] or (sname[0:2] == "P2" and dpar.name[0:2] != "P2"):
+                            # WPAR default set from PPAR
+                            warning("Unexpected default '%s' for binning parameter '%s'" % (dpar.name, sname))
+                        while dpar.defv.type == "NAME" and dpar.defv.e1 in gParameters:
+                            dpar = gParameters[dpar.defv.e1]
+                        if dpar.defv.type != "NUMBER" or dpar.defv.e1 != 0:
+                            warning("Non-zero default value (%s) for binning parameter '%s'" % (spar.defv.e1, sname))
+                    else:
+                        warning("Unexpected default value (type %s) for binning parameter '%s'" % (sname, spar.defv.type))
+            if len(sname) > len(pname) and pname == sname[len(sname)-len(pname):]:
+                # LPAR, WPAR, PPAR, P2PAR, etc.
+                pfx = sname[0:len(sname)-len(pname)]
             elif (pname[-1].lower() == 'o' or pname[-1] == '0') \
                 and pname[:-1] == sname[0:len(pname)-1]:
+                # PARO and PARL, PARWL, etc.
                 sfx = sname[len(pname)-1:]
             elif pname[0:2].lower() == 'po' and pname[2:] == sname[len(sname)-len(pname)+2:]:
+                # POPAR and LPAR, WPAR, etc.
                 pfx = sname[0:2]
     return [fact, oper, pfx, sfx]
 # end of checkBinningTerm
@@ -3505,7 +3559,7 @@ def checkBinningTerm(t_in, pname):
 # keep track of binning equation patterns
 gBinningPatterns = [[],[]]
 
-def checkBinning(vname, t0, t1, t2, t3, line):
+def checkBinning(vname, t0, t1, t2, t3, t4, t5, line):
     global gBinningPatterns, gFileName, gLineNo
     if t0.type == "NAME" and t0.e1 in gParameters:
         pname = t0.e1
@@ -3542,11 +3596,25 @@ def checkBinning(vname, t0, t1, t2, t3, line):
         [fact1, op1, pfx1, sfx1] = checkBinningTerm(t1, pname)
         [fact2, op2, pfx2, sfx2] = checkBinningTerm(t2, pname)
         [fact3, op3, pfx3, sfx3] = checkBinningTerm(t3, pname)
+        if t4:
+            [fact4, op4, pfx4, sfx4] = checkBinningTerm(t4, pname)
+        else:
+            [fact4, op4, pfx4, sfx4] = ["", "", "", ""]
+        if t5:
+            [fact5, op5, pfx5, sfx5] = checkBinningTerm(t5, pname)
+        else:
+            [fact5, op5, pfx5, sfx5] = ["", "", "", ""]
         warned = False
         if fact1 != "" and fact2 != "" and fact3 != "":
             if pfx1+sfx1 != "" and pfx2+sfx2 != "" and pfx3+sfx3 != "":
                 if gBinning and vpfx == "" and vsfx == "":
                     warning("Did not find parameter name '%s' in binning variable name '%s'" % (pname, vname))
+                    warned = True
+                if t4 and pfx4+sfx4 == "":
+                    warning("Binning equation to set '%s' involves '%s'" % (vname, t4.asString()))
+                    warned = True
+                if t5 and pfx5+sfx5 == "":
+                    warning("Binning equation to set '%s' involves '%s'" % (vname, t5.asString()))
                     warned = True
             elif pfx1+sfx1 == "" and (pfx2+sfx2 != "" or pfx3+sfx3 != ""):
                 warning("Binning equation to set '%s' involves '%s'" % (vname, t1.asString()))
@@ -3557,19 +3625,26 @@ def checkBinning(vname, t0, t1, t2, t3, line):
             elif pfx3+sfx3 == "" and (pfx1+sfx1 != "" or pfx2+sfx2 != ""):
                 warning("Binning equation to set '%s' involves '%s'" % (vname, t3.asString()))
                 warned = True
-        new_pat = [vpfx+vsfx, pfx0+sfx0, fact1+op1, pfx1+sfx1, fact2+op2, pfx2+sfx2, fact3+op3, pfx3+sfx3]
+        new_pat = [vpfx+vsfx, pfx0+sfx0, fact1+op1, pfx1+sfx1, fact2+op2, pfx2+sfx2, fact3+op3, pfx3+sfx3, fact4+op4, pfx4+sfx4, fact5+op5, pfx5+sfx5]
+        if gBinning and (gVerbose or gDebug):
+            if fact3 == "":
+                t3 = "0"
+            else:
+                t3 = pfx3 + "[par]" + sfx3 + " " + op3 + " " + fact3
+            if fact4 == "":
+                t4 = "0"
+            else:
+                t4 = pfx4 + "[par]" + sfx4 + " " + op4 + " " + fact4
+            if fact5 == "":
+                t5 = "0"
+            else:
+                t5 = pfx5 + "[par]" + sfx5 + " " + op5 + " " + fact5
+        do_print = False
         if len(gBinningPatterns[0]) == 0:
             if (vpfx != "" or vsfx != "") and (pfx1+sfx1 != "" or pfx2+sfx2 != "" or pfx3+sfx2 != ""):
                 gBinningPatterns[0] = [gFileName[-1], gLineNo[-1]] + new_pat
                 if gBinning and (gVerbose or gDebug):
-                    if fact3 == "":
-                        t3 = "0"
-                    else:
-                        t3 = pfx3 + "[par]" + sfx3 + " " + op3 + " " + fact3
-                    print("Binning pattern: %s[par]%s = %s[par]%s + %s[par]%s %s %s + %s[par]%s %s %s + %s" \
-                          % (vpfx, vsfx, pfx0, sfx0, pfx1, sfx1, op1, fact1, pfx2, sfx2, op2, fact2, t3))
-                    if gDebug:
-                        print("  derived from %s" % line)
+                    do_print = True
         elif gBinning and not warned:
             matched = False
             for old_pat in gBinningPatterns:
@@ -3578,6 +3653,13 @@ def checkBinning(vname, t0, t1, t2, t3, line):
             if not matched:
                 warning("Binning equation does not match that on line %d of %s" % (gBinningPatterns[0][1], gBinningPatterns[0][0]))
                 gBinningPatterns.append( [gFileName[-1], gLineNo[-1]] + new_pat )
+                if gVerbose or gDebug:
+                    do_print = True
+        if do_print:
+            print("Binning pattern: %s[par]%s = %s[par]%s + %s[par]%s %s %s + %s[par]%s %s %s + %s + %s + %s" \
+                  % (vpfx, vsfx, pfx0, sfx0, pfx1, sfx1, op1, fact1, pfx2, sfx2, op2, fact2, t3, t4, t5))
+            if gDebug:
+                print("    derived from %s" % line)
 # end of checkBinning
 
 
@@ -4173,7 +4255,18 @@ def parseOther( line ):
                                 t1 = rhs.e1.e1.e2
                                 t0 = rhs.e1.e1.e1
                                 if t0.type == "NAME" and (t1.type == "*" or t1.type == "/"):
-                                    checkBinning(varname, t0, t1, t2, t3, line)
+                                    checkBinning(varname, t0, t1, t2, t3, 0, 0, line)
+                                elif t0.type == "+" and (t1.type == "*" or t1.type == "/"):
+                                    # P_i = P + Inv_L*LP + Inv_NFIN*NP + Inv_LNFIN*PP + Inv_W*WP + Inv_WL*WLP;
+                                    t5 = t3
+                                    t4 = t2
+                                    t3 = t1
+                                    t2 = t0.e2
+                                    if t0.e1.type == "+" and (t2.type == "*" or t2.type == "/"):
+                                        t1 = t0.e1.e2
+                                        t0 = t0.e1.e1
+                                        if t0.type == "NAME" and (t1.type == "*" or t1.type == "/"):
+                                            checkBinning(varname, t0, t1, t2, t3, t4, t5, line)
                     val = parser.lex()
                     if val == ord(';'):
                         val = parser.lex()
@@ -5492,7 +5585,7 @@ class versionAction(argparse.Action):
         return
     def __call__(self, parser, namespace, values, option_string=None):
         print("""
-VAMPyRE version 1.4
+VAMPyRE version 1.5
 """)
         sys.exit()
 
