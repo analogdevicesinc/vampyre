@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.2, 6-Aug-2020
+# version 1.3, 21-Aug-2020
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -57,12 +57,14 @@ gNodenames     = {} # internal nodes
 gBranches      = {}
 gBlocknames    = {}
 gStatementInCurrentBlock = False
+gMissingConstantsFile = ""
 gMacros        = {}
 gIfDefStatus   = []
 gScopeList     = []
 gConditions    = [] # if-conditions in play
 gCondBiasDep   = [] # whether conditions are bias-dependent:
                     # 0 (no), 1 (from if cond), 2 (yes), 3 (deriv error), 4 (ddx)
+gAnalogInitial = []
 gCurrentFunc   = 0
 gFileName      = []
 gLineNo        = []
@@ -153,7 +155,7 @@ for fn in ["atan2", "hypot", "pow"]:
     gMathFunctions[fn] = 2
     gMathFunctions["$"+fn] = 2
 # not for use in compact models
-for fn in ["idtmod", "absdelay", "transition", "slew", "last_crossing",
+for fn in ["idtmod", "absdelay", "analysis", "transition", "slew", "last_crossing",
            "laplace_nd", "laplace_np", "laplace_zd", "laplace_zp",
            "zi_nd", "zi_np", "zi_zd", "zi_zp"]:
     gMathFunctions[fn] = 99
@@ -199,6 +201,7 @@ class Variable:
   def __init__(self, name, type, oppt, file, line):
     self.name = name
     self.type = type         # real, integer
+    self.range = []
     self.oppt = oppt         # operating-point variable
     self.declare = [file, line]
     self.assign = -1         # line where value assigned
@@ -262,6 +265,8 @@ class Expression:
     elif self.type == "FUNCCALL":
         deps = []
         if self.e1 in gAccessFuncs:
+            if len(gAnalogInitial) > 0 and gAnalogInitial[-1]:
+                error("Branch access in analog initial block")
             nargs = len(self.args)
             if nargs > 0:
                 nname1 = self.args[0].e1
@@ -301,7 +306,7 @@ class Expression:
                         dname2 = gPortnames[nname2].discipline
                     elif nname2 in gNodenames:
                         dname2 = gNodenames[nname2].discipline
-                    if dname2 != dname:
+                    if dname2 != "" and dname2 != dname:
                         error("Nodes '%s' and '%s' belong to different disciplines" % (nname1, nname2))
                 if nname1 != "":
                     if nname1 in gBranches:
@@ -527,7 +532,7 @@ class Parser:
     return self.token == TOKEN_STRING
 
   def isEscaped(self):
-       return self.escaped
+    return self.escaped
 
   def getNumber(self):
     return self.number
@@ -1248,15 +1253,24 @@ class Parser:
     if self.peekChar() == '[':
         self.token = ord(self.getChar())
     if self.token == ord('['):
+        if name in gPortnames:
+            port = gPortnames[name]
+        elif name in gNodenames:
+            port = gNodenames[name]
+        else:
+            port = False
+        if name in gVariables:
+            var = gVariables[name]
+        else:
+            var = False
+            sname = getCurrentScope() + name
+            if sname in gVariables:
+                var = gVariables[sname]
+        if not port and not var:
+            error("Identifier '%s' is not a vector port or array, cannot index" % name)
         sel = self.getExpression()
         if sel.type == "NUMBER":
             index = sel.number
-            if name in gPortnames:
-                port = gPortnames[name]
-            elif name in gNodenames:
-                port = gNodenames[name]
-            else:
-                port = False
             if port:
                 if port.is_bus:
                     if (index > port.msb and index > port.lsb) \
@@ -1264,10 +1278,19 @@ class Parser:
                         error("Invalid index %d, port '%s' range is [%d:%d]" % (index, name, port.msb, port.lsb))
                 else:
                     error("Port '%s' is not a bus, cannot index" % name)
-            else:
-                error("Identifier '%s' is not a vector port, cannot index" % name)
-        else:
-            warning("Unsupported index for bus access (type %s)" % sel.type)
+            elif var:
+                if len(var.range) == 2:
+                    msb = var.range[0]
+                    lsb = var.range[1]
+                    if (index > msb and index > lsb) \
+                          or (index < msb and index < lsb):
+                        error("Invalid index %d, variable '%s' range is [%d:%d]" % (index, name, msb, lsb))
+                elif var.range == []:
+                    error("Identifier '%s' is not an array, cannot index" % name)
+                else:
+                    error("Unexpected range of variable '%s%s'" % (name, var.range))
+        elif gVerbose:
+            notice("Not validating vector index '%s[%s]'" % (name, sel.asString()))
         if self.peekChar() == ']':
             self.getChar()
             self.eatSpace()
@@ -1325,6 +1348,17 @@ class Parser:
                 valid = False
     if valid:
         val = self.lex()
+        if val == ord('-') or val == ord('+'):
+            # inout [0:width-1] port;
+            oper = chr(val)
+            val = self.lex()
+            if self.isNumber():
+                num = self.getNumber()
+                if oper == ord('-'):
+                    lsb -= num
+                elif oper == ord('+'):
+                    lsb += num
+                val = self.lex()
         if val != ord(']'): # pragma: no cover
             valid = False
     if valid:
@@ -1738,7 +1772,11 @@ def getAttributes( line ):
                     if attrib[i] == ',':
                         i += 1
                     elif value == "":
-                        error("Missing '=' in attribute")
+                        if attrib[i].isalnum():
+                            error("Missing '=' or ',' in attribute")
+                        else:
+                            error("Unexpected character '%s' in attribute" % attrib[i])
+                            i += 1
         else: # pragma: no cover
             fatal("Malformed attribute")
         start = line.find("(*")
@@ -2010,7 +2048,10 @@ def expandMacro( line ):
             error("Can't handle compiler directive `%s in macro text" % name)
             start = i
         else:
-            error("Undefined macro `%s" % name)
+            if gMissingConstantsFile != "" and name[0:2] in ["M_", "P_"]:
+                error("Undefined macro `%s; please check %s" % (name, gMissingConstantsFile))
+            else:
+                error("Undefined macro `%s" % name)
             start = i
         pos = findFirstUnquotedTic(line,start)
     return line
@@ -2054,12 +2095,15 @@ def parseNatureDecl( line, defined ):
         fatal("Parse error looking for nature name")
 
     if name != "":
-        valid = checkIdentifierCollisions(name, name, escaped, "Nature")
-        if valid:
+        if defined:
+            valid = checkIdentifierCollisions(name, name, escaped, "Nature")
+            if valid:
+                nature = Nature(name, defined)
+                gNatures[name] = nature
+            gScopeList.append("NATURE::" + name)
+        elif not name in gNatures:
             nature = Nature(name, defined)
             gNatures[name] = nature
-        if defined:
-            gScopeList.append("NATURE::" + name)
 
 
 def parseNatureLine( line ):
@@ -2320,9 +2364,9 @@ def parseFunction( line ):
         error("Invalid type '%s' for function '%s'" % (ftype, fname))
 
     gScopeList.append("FUNCTION::" + fname)
+    gCurrentFunction = Function(fname, ftype)
     valid = checkIdentifierCollisions(fname, fname, escaped, "Function")
     if valid:
-        gCurrentFunction = Function(fname, ftype)
         gUserFunctions[fname] = gCurrentFunction
         # implicit declaration of return variable
         scope = getCurrentScope()
@@ -2450,7 +2494,25 @@ def parseParamDecl( line, attribs ):
         val = parser.lex()
         while parser.isIdentifier():
             str = parser.getString()
-            if str == "from":
+            if ptype == "string":
+                val = parser.lex()
+                if val == ord('\''):
+                    val = parser.lex()
+                if val == ord('{'):
+                    val = parser.lex()
+                    while parser.isString():
+                        val = parser.lex()
+                        if val == ord(','):
+                            val = parser.lex()
+                else:
+                    error("Invalid %s in range" % format_char(val))
+                    break
+                if val == ord('}'):
+                    val = parser.lex()
+                else:
+                    error("Invalid %s in range" % format_char(val))
+                    break
+            elif str == "from":
                 val = parser.lex()
                 lend = ""
                 if val == ord('['):
@@ -2536,7 +2598,7 @@ def parseVariableDecl( line, attribs ):
         if vtype == "":
             if parser.isIdentifier():
                 vtype = parser.getString()
-                if not vtype in ["integer", "real", "string"]:
+                if not vtype in ["integer", "real", "genvar", "string"]:
                     err_msg = ("Unexpected variable type '%s'" % vtype)
                 val = parser.lex()
 
@@ -2570,6 +2632,10 @@ def parseVariableDecl( line, attribs ):
                             # (separate question whether the output is used outside the function)
                             var.used = True
             val = parser.lex()
+            if val == ord('['):
+                bus_range = parser.getBusRange()
+                gVariables[vname].range = bus_range
+                val = parser.token
             if val == ord('='):
                 # real var = 1;
                 error("Variable initializers not supported")
@@ -2578,7 +2644,7 @@ def parseVariableDecl( line, attribs ):
         else:
             if vtype == "": # pragma: no cover
                 fatal("Parse error looking for variable type")
-            elif vtype in ["integer", "real", "string"]:
+            elif vtype in ["integer", "real", "genvar", "string"]:
                 err_msg = ("Missing identifier after '%s' " % vtype)
             elif parser.isNumber():
                 num = parser.getNumber()
@@ -2600,7 +2666,7 @@ def parseVariableDecl( line, attribs ):
             val = parser.lex()
         elif parser.isIdentifier():
             str = parser.getString()
-            if str in ["inout", "input", "output", "real", "integer"]:
+            if str in ["inout", "input", "output", "real", "integer", "genvar"]:
                 error("Missing ';' after list of variables")
                 vtype = str;
                 val = parser.lex()
@@ -2786,7 +2852,6 @@ def registerContrib( afunc, type, node1, node2, cond_in, bias_dep_in ):
         warning("Switch branch (%s) with bias-dependent condition" % bprint)
 
 
-
 def checkPorts():
     global gFileName, gLineNo
     for port in gPortnames.values():
@@ -2925,6 +2990,7 @@ def checkParmsAndVars():
                                 % (func.name, func.args[i]) )
         elif gVerbose:
             notice("User-defined function '%s' is never used" % func.name)
+# end of check checkParmsAndVars
 
 
 def getIdentifierType( name ):
@@ -3190,7 +3256,6 @@ def reformatConditions( conds ):
         return cond
 
 
-
 def markVariableAsSet( varname, bias_dep_in, cond_in, biases_in, for_var, set_by_func, fname, argnum ):
     global gLineNo
 
@@ -3272,6 +3337,7 @@ def parseOther( line ):
     global gConditionForNextStmt, gConditionForLastStmt
     global gCondBiasDForNextStmt, gCondBiasDForLastStmt
     global gStatementInCurrentBlock
+    global gAnalogInitial
 
     this_cond = gConditionForNextStmt
     gConditionForNextStmt = Expression("NOTHING")
@@ -3281,12 +3347,12 @@ def parseOther( line ):
     gCondBiasDForNextStmt = 0
     last_c_bd = gCondBiasDForLastStmt
     gCondBiasDForLastStmt = 0
+    is_analog_initial = False
 
     parser = Parser(line)
     val = parser.lex()
     keywd = ""
 
-    # TODO: analog initial
     if parser.isIdentifier():
         keywd = parser.getString()
         if keywd == "analog":
@@ -3296,6 +3362,7 @@ def parseOther( line ):
             if keywd == "initial":
                 val = parser.lex()
                 warning("Restrictions in 'analog initial' not checked")
+                is_analog_initial = True
 
     if parser.isNumber() or (keywd == "default" and parser.peekChar() == ":"):
         if len(gScopeList) > 0 and gScopeList[-1].startswith("CASE::"):
@@ -3355,6 +3422,12 @@ def parseOther( line ):
                 gCondBiasDep.pop()
             if bad_scope:
                 error("Found 'end' without corresponding 'begin'")
+            if len(gAnalogInitial) > 0:
+                gAnalogInitial.pop()
+            if len(gAnalogInitial) > 0:
+                is_analog_initial = gAnalogInitial[-1]
+            else:
+                is_analog_initial = False
             val = parser.lex()
             if parser.isIdentifier():
                 keywd = parser.getString()
@@ -3612,6 +3685,7 @@ def parseOther( line ):
             gCondBiasDep.append(this_c_bd)
             this_cond = Expression("NOTHING")
             this_c_bd = 0
+            gAnalogInitial.append(is_analog_initial)
 
         if keywd == "case":
             var = parser.getExpression()
@@ -3699,6 +3773,7 @@ def parseOther( line ):
             val = parser.lex()
             while parser.isIdentifier():
                 pname = parser.getString()
+                escaped = parser.isEscaped()
                 if pname in gNodenames:
                     node = gNodenames[pname]
                     if node.type == "internal":
@@ -3813,6 +3888,8 @@ def parseOther( line ):
             error("Unsupported declaration: '%s'" % keywd)
 
         else:
+            if parser.peekChar() == '[':
+                parser.checkBusIndex(keywd)
             val = parser.lex()
             if val == ord('='):
                 all_zero_assigns = True
@@ -3848,7 +3925,10 @@ def parseOther( line ):
                             this_c_bd = gCondBiasDForLastStmt
                         elif gStyle and not all_zero_assigns:
                             style("Multiple assignments on a single line")
+                        if parser.peekChar() == '[':
+                            parser.checkBusIndex(keywd)
                         val = parser.lex()
+                val = parser.lex()
                 if val == 0 and keywd != "":
                     if keywd == "end":
                         gConditionForLastStmt = this_cond
@@ -3863,6 +3943,8 @@ def parseOther( line ):
                 if keywd in gAccessFuncs:
                     gStatementInCurrentBlock = True
                     acc = keywd
+                    if is_analog_initial:
+                        error("Branch access in analog initial block")
                     nname1 = ""
                     nname2 = ""
                     val = parser.lex()
@@ -3878,7 +3960,12 @@ def parseOther( line ):
                             val = parser.lex()
                     else:
                         error("Missing node/branch name in potential or flow access")
-                    if val == ord(','):
+                    if is_port_flow:
+                        if val == ord('>'):
+                            val = parser.lex()
+                        else:
+                            error("Missing '>' in port flow access")
+                    elif val == ord(','):
                         val = parser.lex()
                         if parser.isIdentifier():
                             nname2 = parser.getString()
@@ -3888,11 +3975,6 @@ def parseOther( line ):
                                 val = parser.lex()
                         else:
                             error("Missing node/branch name after ','")
-                    if is_port_flow:
-                        if val == ord('>'):
-                            val = parser.lex()
-                        else:
-                            error("Missing '>' in port flow access")
                     if val == ord(')'):
                         val = parser.lex()
                     else:
@@ -4025,23 +4107,31 @@ def parseOther( line ):
                 val = parser.lex()
                 if val == ord('('):
                     arg.type = "FUNCCALL"
-                    val = parser.lex()
-                    while parser.isString():
-                        sub = Expression("STRING")
-                        sub.e1 = parser.getString()
-                        arg.args.append(sub)
+                    if arg.e1 in ["initial_step", "final_step"]:
                         val = parser.lex()
-                        if val == ord(','):
+                        while parser.isString():
+                            sub = Expression("STRING")
+                            sub.e1 = parser.getString()
+                            arg.args.append(sub)
                             val = parser.lex()
+                            if val == ord(','):
+                                val = parser.lex()
+                    else: # cross, above
+                        while val != ord(')'):
+                            sub = parser.getExpression()
+                            arg.args.append(sub)
+                            val = parser.lex()
+                            if val == ord(','):
+                                val = parser.lex()
                     if val == ord(')'):
                         val = parser.lex()
                     else:
                         error("Missing ')' in event specification")
-                if parser.isIdentifier():
-                    if parser.getString() == "or":
-                        val = parser.lex()
-                        if not parser.isIdentifier():
-                            error("Missing event after 'or'")
+                    if parser.isIdentifier():
+                        if parser.getString() == "or":
+                            val = parser.lex()
+                            if not parser.isIdentifier():
+                                error("Missing event after 'or'")
             if val == ord(')'):
                 val = parser.lex()
         if parser.isIdentifier():
@@ -4153,7 +4243,7 @@ def addBasicDisciplines():
 
 
 def handleCompilerDirectives( line ):
-    global gIfDefStatus, gIncDir
+    global gIfDefStatus, gIncDir, gMissingConstantsFile
 
     line = line.strip()
     if line == "":
@@ -4219,31 +4309,57 @@ def handleCompilerDirectives( line ):
             did_compiler_directive = True
 
         elif line.startswith("`include"):
-            qt = line.find("\"")
-            if qt > 8:
-                fname = line[qt+1:]
-                qt = fname.find("\"")
-                if qt > 0:
-                    fname = fname[0:qt]
+            rest = line[8:].strip()
+            while rest != "":
+                if rest[0] == '"':
+                    fname = rest[1:]
+                    qt = fname.find("\"")
+                    if qt > 0:
+                        rest  = fname[qt+1:].strip()
+                        fname = fname[0:qt]
+                    elif qt == 0:
+                        error("Empty filename for `include")
+                        rest = fname[1:].strip()
+                        fname = ""
+                    else:
+                        error("Missing end-quote for `include")
+                        rest = ""
+                else:
+                    error("Filename should be enclosed in quotes")
+                    fname = rest
+                    qt = fname.find(" ")
+                    if qt > 0:
+                        rest  = fname[qt+1:].strip()
+                        fname = fname[0:qt]
+                    else:
+                        rest = ""
+                if fname != "":
                     fpath = os.path.dirname(gFileName[-1])
                     f_fpn = os.path.join(fpath, fname)
                     found = False
                     if os.path.exists(f_fpn) and os.path.isfile(f_fpn):
                         found = True
                         parseFile( f_fpn )
-                    for fpath in gIncDir:
-                        f_fpn = os.path.join(fpath, fname)
-                        if os.path.exists(f_fpn) and os.path.isfile(f_fpn):
-                            found = True
-                            parseFile( f_fpn )
+                    else:
+                        for fpath in gIncDir:
+                            f_fpn = os.path.join(fpath, fname)
+                            if os.path.exists(f_fpn) and os.path.isfile(f_fpn):
+                                found = True
+                                parseFile( f_fpn )
+                                break
                     if not found:
                         error("File not found: %s" % line)
-                        if line.find("\"discipline.h\"") > 0 or line.find("\"disciplines.vams\"") > 0:
+                        if fname == "discipline.h" or fname == "disciplines.vams":
                             addBasicDisciplines()
-                else:
-                    error("Missing end-quote for `include")
-            else:
-                error("Filename should be enclosed in quotes")
+                        elif fname == "constants.h" or fname == "constants.vams":
+                            gMissingConstantsFile = fname
+                if len(rest) > 0:
+                    if rest.startswith("`include"):
+                        error("Multiple `include directives on one line")
+                        rest = rest[8:].strip()
+                    else:
+                        error("Unexpected characters after `include: %s" % rest)
+                        rest = ""
             did_compiler_directive = True
 
         elif line.startswith("`begin_keywords")      or line.startswith("`end_keywords") \
@@ -4267,7 +4383,9 @@ def handleCompilerDirectives( line ):
 
 
 def preProcessNatures( lines ):
+    # preprocess so idt_natures are defined
     for line in lines:
+        gLineNo[-1] += 1
         if line.startswith("nature") and len(gScopeList) == 0:
             parseNatureDecl(line, False)
 
@@ -4405,7 +4523,8 @@ def parseLines( lines ):
             # parameters, variables, ports
             #
             elif part.startswith("parameter") or part.startswith("aliasparam") or part.startswith("localparam") or \
-                    (part.startswith("real") and part[4].isspace()) or (part.startswith("integer") and part[7].isspace()):
+                    (part.startswith("real") and part[4].isspace()) or (part.startswith("integer") and part[7].isspace()) or \
+                    (part.startswith("genvar") and part[6].isspace()):
                 if part[-1] != ';' and i >= len(parts):
                     tmpline = part
                     tmpj = j
@@ -4549,6 +4668,41 @@ def makeIndent( num_spaces ):
     return indent
 
 
+def fixSpaces(line, keywd):
+    ret = ""
+    i = 0
+    klen = len(keywd)
+    while i < len(line):
+        if line[i:i+klen] == keywd:
+            ret += line[i:i+klen]
+            i += klen
+            break
+        else:
+            ret += line[i]
+            i += 1
+    ret += ' '
+    while i < len(line) and line[i].isspace():
+        i += 1
+    if line[i] == '(':
+        num_parens = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == '(':
+                num_parens += 1
+            elif ch == ')':
+                num_parens -= 1
+            ret += line[i]
+            i += 1
+            if num_parens == 0:
+                break
+        if i < len(line):
+            ret += ' '
+            while i < len(line) and line[i].isspace():
+                i += 1
+    ret += line[i:]
+    return ret
+
+
 def parseFile( filename ):
     global gFileName, gLineNo, gScopeList, gVAMScompdir
     print("Reading %s" % filename)
@@ -4668,7 +4822,7 @@ def parseFile( filename ):
                                 style("Inconsistent indentation inside `ifdef (compare with line %d)" % first_inside_ifdef )
                     stripped = orig_line.strip()
                     if stripped != "":
-                        fixed_line = makeIndent(required_indent) + stripped + "\n"
+                        fixed_line = makeIndent(required_indent+single_line_indent) + stripped + "\n"
                     else:
                         fixed_line = "\n"
                 else:
@@ -4689,6 +4843,28 @@ def parseFile( filename ):
                             # else extra end, or incorrect indent on a previous line
                             if keywd == "endcase":
                                 in_case_block = False
+                            elif keywd == "end":
+                                rest = parser.peekRestOfLine().strip()
+                                if rest.startswith("else if"):
+                                    rest = rest[7:]
+                                    if len(rest) < 2 or rest[0] != ' ' or rest[1] != '(':
+                                        style("Prefer single space after 'if'")
+                                        if gFixIndent:
+                                            fixed_line = fixSpaces(fixed_line, "else if")
+                        elif keywd in ["if", "for", "while", "repeat", "case"]:
+                            rest = parser.peekRestOfLine()
+                            if len(rest) < 2 or rest[0] != ' ' or rest[1] != '(':
+                                style("Prefer single space after '%s'" % keywd)
+                                if gFixIndent:
+                                    fixed_line = fixSpaces(fixed_line, keywd)
+                        elif keywd == "else":
+                            rest = parser.peekRestOfLine().strip()
+                            if rest.startswith("if"):
+                                rest = rest[2:]
+                                if len(rest) < 2 or rest[0] != ' ' or rest[1] != '(':
+                                    style("Prefer single space after 'if'")
+                                    if gFixIndent:
+                                        fixed_line = fixSpaces(fixed_line, "if")
                     elif val == ord('@'):
                         keywd = "@"
                     this_indent = required_indent
@@ -4704,7 +4880,9 @@ def parseFile( filename ):
                             this_indent += single_line_indent
                             if continued_line != "" and stripped.find("begin") > 0:
                                 required_indent += single_line_indent
-                        single_line_indent = 0
+                                single_line_indent = 0
+                        if continued_line == "":
+                            single_line_indent = 0
                     if indent != this_indent:
                         bad_indent = True
                         #if indent >= this_indent + optional_indent:
@@ -4873,8 +5051,8 @@ def parseFile( filename ):
                                 elif (indent_ifdef == 0 and indent != 0) or \
                                      (indent_ifdef > 0 and indent != this_indent):
                                     style("Inconsistent indentation for `ifdef (compare with line %d)" % first_ifdef_indent, "Incorrect indent")
-                                    if indent_ifdef == 0:
-                                        this_indent = 0
+                                if indent_ifdef == 0:
+                                    this_indent = 0
                                 fixed_line = makeIndent(this_indent) + fixed_line.strip() + "\n"
                             elif keywd == "else":
                                 if indent_inside_ifdef == -1:
@@ -4976,21 +5154,27 @@ def parseFile( filename ):
             lineToParse = ""
 
     # write file, if there are any changes
-    if did_fix:
+    if gFixIndent:
         fixfile = filename + ".fixed"
-        with open(fixfile, "w") as OF:
-            OF.writelines(fixedLines)
-        print("Wrote %s with fixed indentation" % fixfile)
-    elif gFixIndent and gVerbose:
-        print("%s did not need fixes to indentation" % filename)
+        if did_fix:
+            with open(fixfile, "w") as OF:
+                OF.writelines(fixedLines)
+            print("Wrote %s with fixed indentation" % fixfile)
+        else:
+            if os.path.exists(fixfile) and os.path.isfile(fixfile):
+                print("%s did not need fixes to indentation; removing %s" % (filename, fixfile))
+                os.remove(fixfile)
+            elif gVerbose:
+                print("%s did not need fixes to indentation" % filename)
 
     # empty the arrays
     fixedLines = []
     linesOfCode = []
-    gLineNo[-1] = 0
 
     # process the lines
+    gLineNo[-1] = 0
     preProcessNatures(linesToParse)
+    gLineNo[-1] = 0
     parseLines(linesToParse)
 
     # done with this file
@@ -5032,7 +5216,7 @@ class versionAction(argparse.Action):
         return
     def __call__(self, parser, namespace, values, option_string=None):
         print("""
-VAMPyRE version 1.2
+VAMPyRE version 1.3
 """)
         sys.exit()
 
