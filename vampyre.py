@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.8.4, 21-July-2021
+# version 1.8.5, 12-Aug-2021
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -47,7 +47,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.8.4"
+gVersionNumber = "1.8.5"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -205,7 +205,8 @@ class Parameter:
     self.max = float("inf")
     self.min = float("-inf")
     self.exclude = []
-    self.inst = False        # instance parameter (or model)
+    self.inst = False        # instance parameter (or both)
+    self.model = False       # model parameter (or both)
     self.used = False        # whether used
     self.is_alias = False    # True for aliasparam (should not be used)
 
@@ -265,6 +266,12 @@ class Branch:
     self.lhs_pot  = 0    # potential contrib: 0=no, 1=yes, 2=bias-dep condition
     #self.rhs_flow = 0    # flow probe
     #self.rhs_pot  = 0    # potential probe
+
+class Macro:
+  def __init__(self, name, text):
+    self.name = name
+    self.text = text
+    self.args = []
 
 class Function:
   def __init__(self, name, type):
@@ -538,13 +545,6 @@ class Expression:
     #    return "TODO"
     else: # pragma: no cover
         fatal("Unhandled expression type '%s' in asString" % self.type)
-
-
-class Macro:
-  def __init__(self, name, text):
-    self.name = name
-    self.text = text
-    self.args = []
 
 
 class Parser:
@@ -2377,6 +2377,7 @@ def findFirstUnquotedTic( line, start ):
         i += 1
     return pos
 
+
 def expandMacro( line ):
     start = 0
     pos = findFirstUnquotedTic(line, start)
@@ -2749,7 +2750,7 @@ def printModuleSummary():
         for (k,p) in gParameters.items():
             if p.inst:
                 InstParms[k] = p
-            else:
+            if p.model: # can be both model and inst
                 ModelParms[k] = p
         if len(InstParms):
             if gVerbose or len(InstParms) < 20:
@@ -2926,6 +2927,7 @@ def parseParamDecl( line, attribs ):
         fatal("Parse error looking for 'parameter'")
 
     inst = False
+    model = True
     units = ""
     if len(attribs) > 0:
         for i in range(0, len(attribs)-1, 2):
@@ -2933,6 +2935,7 @@ def parseParamDecl( line, attribs ):
                 val = attribs[i+1].lower()
                 if val == "instance" or val == "\"instance\"":
                     inst = True
+                    model = False
                 elif val == "both" or val == "\"both\"":
                     inst = True
             elif attribs[i] == "units":
@@ -2970,6 +2973,7 @@ def parseParamDecl( line, attribs ):
 
         parm = Parameter(pname, ptype, gFileName[-1], gLineNo[-1])
         parm.inst = inst
+        parm.model = model
         parm.units = units
 
         if val != ord('='):
@@ -3063,6 +3067,11 @@ def parseParamDecl( line, attribs ):
                     error("Parameter '%s' default value may not depend on itself" % pname)
                 elif dep in gParameters:
                     gParameters[dep].used = True
+                    if parm.model and not gParameters[dep].model:
+                        if parm.defv.type == "NAME" and parm.defv.e1 == dep:
+                            error("Default value of model parameter '%s' is an instance parameter '%s'" % (pname, dep))
+                        else:
+                            error("Default value of model parameter '%s' depends on instance parameter '%s'" % (pname, dep))
                 else:
                     if dep in gVariables:
                         error("Parameter '%s' default value may not depend on variable '%s'" % (pname, dep))
@@ -3848,39 +3857,40 @@ def markVariableAsSet( varname, bias_dep_in, cond_in, biases_in, for_var, set_by
     while not found:
         vn = scope + varname
         if vn in gVariables:
+            var = gVariables[vn]
             found = True
             [conds, bias_dep] = getCurrentConditions(cond_in, bias_dep_in)
             biases = biases_in
-            if gVariables[vn].type == "integer":
+            if var.type == "integer":
                 if bias_dep > 1:
                     bias_dep = 1
                     biases = []
-            if gVariables[vn].assign < 0:
+            if var.assign < 0:
                 # first assignment
-                gVariables[vn].assign = gLineNo[-1]
+                var.assign = gLineNo[-1]
                 if conds != "":
-                    gVariables[vn].conditions = [conds]
-                gVariables[vn].bias_dep = bias_dep
-                gVariables[vn].biases = biases
-            elif len(gVariables[vn].conditions) > 0:
+                    var.conditions = [conds]
+                var.bias_dep = bias_dep
+                var.biases = biases
+            elif len(var.conditions) > 0:
                 if conds == "":
                     # no conditions for this assignment
-                    gVariables[vn].conditions = []
-                    gVariables[vn].bias_dep = bias_dep
-                    gVariables[vn].biases   = biases
+                    var.conditions = []
+                    var.bias_dep = bias_dep
+                    var.biases   = biases
                 else:
-                    oldconds = gVariables[vn].conditions
-                    gVariables[vn].conditions = mergeConditions(oldconds, conds)
-            if conds == "" or gVariables[vn].bias_dep < bias_dep:
-                gVariables[vn].bias_dep = bias_dep
+                    oldconds = var.conditions
+                    var.conditions = mergeConditions(oldconds, conds)
+            if conds == "" or var.bias_dep < bias_dep:
+                var.bias_dep = bias_dep
             if conds == "": # replace previous biases
-                gVariables[vn].biases   = biases
+                var.biases   = biases
             else: # append these biases, possibly overkill
                 for bias in biases:
-                    if not bias in gVariables[vn].biases:
-                        gVariables[vn].biases.append(bias)
+                    if not bias in var.biases:
+                        var.biases.append(bias)
             if set_by_func:
-                gVariables[vn].funcNameAndArg = [fname, argnum]
+                var.funcNameAndArg = [fname, argnum]
             break
         if scope != "":
             scopes = scope.split(".")
@@ -3953,8 +3963,8 @@ def checkBinningTerm(t_in, pname):
                     term.e2.e1 = term.e2.e1.e1 + "*" + term.e1.e1
                     term.e1.e1 = sparm
     if term.type == "/":
-        # consider 1.0e-6 * LXL / L
-        if term.e1.type == "*" and term.e2.type == "NAME" and (term.e2.e1 == "L" or term.e2.e1 == "W"):
+        # consider 1.0e-6 * LXL / L or WXW * 1.0e-6 / WGAA
+        if term.e1.type == "*" and term.e2.type == "NAME" and term.e2.e1 in gParameters and gParameters[term.e2.e1].inst:
             if term.e1.e1.type == "NUMBER" and term.e1.e2.type == "NAME" and term.e1.e2.e1 in gParameters:
                 # convert to 1.0e-6 / L * LXL
                 term.type = "*"
@@ -3962,6 +3972,13 @@ def checkBinningTerm(t_in, pname):
                 lparm = term.e2 # L or W
                 term.e2 = term.e1.e2
                 term.e1.e2 = lparm
+            elif term.e1.e2.type == "NUMBER" and term.e1.e1.type == "NAME" and term.e1.e1.e1 in gParameters:
+                # convert to 1.0e-6 / WGAA * WXW
+                term.type = "*"
+                term.e1.type = "/"
+                lparm = term.e2 # L or W
+                term.e2 = term.e1.e1
+                term.e1.e1 = lparm
         # consider PXL * 1.0e-6 / (L * NFIN)
         if term.e1.type == "*" and term.e2.type == "*":
             if term.e1.e1.type == "NAME" and term.e1.e1.e1 in gParameters and term.e1.e2.type == "NUMBER":
@@ -3979,10 +3996,11 @@ def checkBinningTerm(t_in, pname):
         if term.e1.type == "NAME" and term.e1.e1 in gParameters:
             sname = term.e1.e1
             fact = term.e2.asString()
-        elif term.e2.type == "NAME" and term.e2.e1 in gParameters:
+        elif oper == "*" and term.e2.type == "NAME" and term.e2.e1 in gParameters:
             sname = term.e2.e1
             fact = term.e1.asString()
-        elif term.e2.type == "NUMBER" and term.e2.number == 0.0:
+        elif (term.e1.type == "NUMBER" and term.e1.number == 0.0) or \
+             (term.e2.type == "NUMBER" and term.e2.number == 0.0):
             # deliberately zero binning term
             pfx = "0.0"
         if sname != "":
@@ -5149,6 +5167,7 @@ def getCurrentScope():
         scope += "."
     return scope
 
+
 def getCurrentConditions( cond_in, c_bd_in ):
     global gConditions, gCondBiasDep
     conds = ""
@@ -5638,13 +5657,6 @@ def getIndent( line ):
     return num_spaces
 
 
-def makeIndent( num_spaces ):
-    indent = ""
-    for i in range(num_spaces):
-        indent += " "
-    return indent
-
-
 def fixSpaces(line, keywd):
     ret = ""
     i = 0
@@ -5823,7 +5835,7 @@ def parseFile( filename ):
                                 if stripped.find("`ifdef") > 0 or stripped.find("`ifndef") > 0 \
                                         or stripped.find("`else") > 0 or stripped.find("`endif") > 0:
                                     this_indent = 0
-                        fixed_line = makeIndent(this_indent) + stripped + "\n"
+                        fixed_line = (this_indent * " ") + stripped + "\n"
                     else:
                         fixed_line = "\n"
                 else:
@@ -5925,7 +5937,7 @@ def parseFile( filename ):
                                 if val != ord('`'):
                                     style("Inconsistent indentation inside module block (compare with line %d)" % first_module_indent )
                                     if gFixIndent:
-                                        fixed_line = makeIndent(required_indent) + fixed_line.strip() + "\n"
+                                        fixed_line = (required_indent * " ") + fixed_line.strip() + "\n"
                             else:
                                 indent_module = 0
                         elif optional_indent_reason == "define":
@@ -6016,7 +6028,7 @@ def parseFile( filename ):
                                 bad_indent = False
                                 is_vams_compdir = True
                                 if gFixIndent and indent > this_indent:
-                                    fixed_line = makeIndent(this_indent) + fixed_line.strip() + "\n"
+                                    fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
                             if keywd == "define":
                                 indent_before_define = required_indent
                                 if required_indent > 0:
@@ -6027,7 +6039,7 @@ def parseFile( filename ):
                                         elif indent_define != 0:
                                             style("Inconsistent indentation of `define (compare with line %d)" % first_define_indent )
                                             if gFixIndent:
-                                                fixed_line = makeIndent(this_indent) + fixed_line.strip() + "\n"
+                                                fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
                                     else:
                                         if indent_define == -1:
                                             indent_define = 1
@@ -6076,7 +6088,7 @@ def parseFile( filename ):
                                     style("Inconsistent indentation for `ifdef (compare with line %d)" % first_ifdef_indent, "Incorrect indent")
                                 if indent_ifdef == 0:
                                     this_indent = 0
-                                fixed_line = makeIndent(this_indent) + fixed_line.strip() + "\n"
+                                fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
                             elif keywd == "else":
                                 if indent_inside_ifdef == -1:
                                     # only comments in the `ifdef block
@@ -6130,7 +6142,7 @@ def parseFile( filename ):
                     if bad_indent:
                         if indent_this_define == 0:
                             this_indent += gSpcPerInd
-                        fixed_line = makeIndent(this_indent) + fixed_line.strip() + "\n"
+                        fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
                     if in_multiline_define and line[-2] != '\\':
                         in_multiline_define = False
                         required_indent = indent_before_define
