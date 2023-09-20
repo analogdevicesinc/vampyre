@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.8.2, 02-May-2021
+# version 1.8.3, 24-May-2021
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -47,6 +47,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
+gVersionNumber = "1.8.3"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -206,6 +207,28 @@ class Parameter:
     self.inst = False        # instance parameter (or model)
     self.used = False        # whether used
     self.is_alias = False    # True for aliasparam (should not be used)
+
+  def getValueRangeStr(self):
+    ret = ""
+    if self.value_range == "nb":
+        ret = "(-inf:inf)"
+    elif self.value_range in ["cc", "co", "oc", "oo"]:
+        if self.value_range[0] == "c":
+            lend = "["
+        else:
+            lend = "("
+        if self.value_range[1] == "c":
+            rend = "]"
+        else:
+            rend = ")"
+        ret = lend + self.min.asString() + ":" + self.max.asString() + rend
+    elif self.value_range == "cz":
+        ret = "[0:inf)"
+    elif self.value_range == "oz":
+        ret = "(0:inf)"
+    elif self.value_range == "sw":
+        ret = "[0:1]"
+    return ret
 
 class Variable:
   def __init__(self, name, type, oppt, file, line):
@@ -968,10 +991,20 @@ class Parser:
                           % (len(args), fname, nargs))
                 if fname == "log":
                     warning("Found base-10 log(); use ln() for natural log")
-                if fname in ["ln", "log", "sqrt"] and len(args) == 1:
+                check_arg = False
+                allow_zero = False
+                if fname in ["ln", "$ln", "log", "$log10", "sqrt", "$sqrt"] and len(args) == 1:
+                    check_arg = True
+                elif fname in ["pow", "$pow"] and len(args) == 2:
+                    expon = args[1]
+                    if expon.type == "NUMBER" and expon.number < 0:
+                        check_arg = True
+                    elif expon.type == "NUMBER" and expon.number > 0 and not expon.is_int:
+                        check_arg = True
+                        allow_zero = True
+                if check_arg:
                     arg = args[0]
-                    allow_zero = False
-                    if fname == "sqrt":
+                    if fname == "sqrt" or fname == "$sqrt":
                         allow_zero = True
                     factors = getParamFactors(arg)
                     if len(factors) > 0:
@@ -983,10 +1016,13 @@ class Parser:
                                         bad_val = "negative"
                                     else:
                                         bad_val = "non-positive"
-                                    if pname == arg_str:
-                                        warning("Parameter range allows %s argument for function '%s(%s)'" % (bad_val, fname, pname))
+                                    if fname in ["pow", "$pow"]:
+                                        warning("Range of parameter '%s' allows %s argument for function '%s(arg,%g)'" % (pname, bad_val, fname, args[1].number))
                                     else:
-                                        warning("Range of parameter '%s' allows %s argument for function '%s()'" % (pname, bad_val, fname))
+                                        if pname == arg_str:
+                                            warning("Parameter range allows %s argument for function '%s(%s)'" % (bad_val, fname, pname))
+                                        else:
+                                            warning("Range of parameter '%s' allows %s argument for function '%s()'" % (pname, bad_val, fname))
                     elif checkFuncArgNoConditions(arg):
                         warning("Parameter range(s) allow negative argument to function '%s(%s)'" % (fname, arg.asString()))
             elif fname in gUserFunctions:
@@ -1132,9 +1168,106 @@ class Parser:
         expr.is_int = lhs.is_int and rhs.is_int
     return expr
 
+  def checkExprZero(self, expr):
+    zero_factors = []
+    if expr.type in ["+", "-"]:
+        pname = ""
+        if expr.e1.type == "NAME" and expr.e1.e1 in gParameters:
+            pname = expr.e1.e1
+            other = expr.e2
+        elif expr.e2.type == "NAME" and expr.e2.e1 in gParameters:
+            pname = expr.e2.e1
+            other = expr.e1
+        if pname != "":
+            if other.type == "NUMBER":
+                if expr.type == "+":
+                    excl = -other.number
+                else:
+                    excl = other.number
+                if not checkParameterRangeExclude(pname, excl):
+                    if not checkConditionsExclude(pname, excl, self.ternary_condition):
+                        msg = "expression 1/" + expr.asString()
+                        if gVerbose:
+                            msg += "\n    range of " + pname + " is "
+                            msg += gParameters[pname].getValueRangeStr()
+                        zero_factors.append(msg)
+            elif other.type == "NAME" and other.e1 in gParameters:
+                pname2 = other.e1
+                if expr.type == "+":
+                    if (checkParamRangePos(pname, False) and checkParamRangePos(pname2, True)) or \
+                       (checkParamRangePos(pname, True)  and checkParamRangePos(pname2, False)) or \
+                       (checkParamRangeNeg(pname, False) and checkParamRangeNeg(pname2, True)) or \
+                       (checkParamRangeNeg(pname, True)  and checkParamRangeNeg(pname2, False)):
+                        bad = False # both positive or both negative
+                    else:
+                        bad = False
+                        if not checkParameterRangeExclude(pname, 0) and \
+                           not checkParameterRangeExclude(pname2, 0) and \
+                           not checkConditionsExclude(pname, 0, self.ternary_condition) and \
+                           not checkConditionsExclude(pname2, 0, self.ternary_condition):
+                            bad = True
+                        else:
+                            can_check = True
+                            for cond in gConditions:
+                                if cond.type != "NOTHING":
+                                    can_check = False
+                            if can_check:
+                                par1 = gParameters[pname]
+                                par2 = gParameters[pname2]
+                                if par1.value_range == "nb" or par2.value_range == "nb":
+                                    bad = True
+                                elif par1.value_range in ["cc", "co", "oc", "oo"] and \
+                                       par2.value_range in ["cc", "co", "oc", "oo"]:
+                                    [min1, got_min1] = getRangeValue(par1.min)
+                                    [max1, got_max1] = getRangeValue(par1.max)
+                                    [min2, got_min2] = getRangeValue(par2.min)
+                                    [max2, got_max2] = getRangeValue(par2.max)
+                                    if got_max1 and max1 > 0 and got_min2 and min2 < 0:
+                                        bad = True
+                                    elif got_max2 and max2 > 0 and got_min1 and min1 < 0:
+                                        bad = True
+                        if bad:
+                            msg = "expression 1/" + expr.asString()
+                            if gVerbose:
+                                msg += "\n    range of " + pname + " is "
+                                msg += gParameters[pname].getValueRangeStr()
+                                if pname2 != pname:
+                                    msg += "\n    range of " + pname2 + " is "
+                                    msg += gParameters[pname2].getValueRangeStr()
+                            zero_factors.append(msg)
+                else:
+                    if (checkParamRangePos(pname, False) and checkParamRangeNeg(pname2, True)) or \
+                       (checkParamRangePos(pname, True)  and checkParamRangeNeg(pname2, False)) or \
+                       (checkParamRangeNeg(pname, False) and checkParamRangePos(pname2, True)) or \
+                       (checkParamRangeNeg(pname, True)  and checkParamRangePos(pname2, False)):
+                        bad = False # (pos)-(neg) or (neg)-(pos)
+                    else:
+                        msg = "expression 1/" + expr.asString()
+                        if gVerbose:
+                            msg += "\n    range of " + pname + " is "
+                            msg += gParameters[pname].getValueRangeStr()
+                            if pname2 != pname:
+                                msg += "\n    range of " + pname2 + " is "
+                                msg += gParameters[pname2].getValueRangeStr()
+                        zero_factors.append(msg)
+    else:
+        factors = getParamFactors(expr)
+        zero_pnames = []
+        for pname in factors:
+            if not pname in zero_pnames and not checkParameterRangeExclude(pname, 0):
+                if not checkConditionsExclude(pname, 0, self.ternary_condition):
+                    zero_pnames.append(pname)
+                    msg = "parameter " + pname
+                    if gVerbose:
+                        msg += "\n    range of " + pname + " is "
+                        msg += gParameters[pname].getValueRangeStr()
+                    zero_factors.append(msg)
+    for pname in zero_factors:
+        warning("Possible division by zero for %s" % pname)
+
   def parseMultiplicative(self, is_cond):
     expr = self.parsePower(is_cond)
-    while self.peekOper() in [ "*", "/", "%"]:
+    while self.peekOper() in ["*", "/", "%"]:
         oper = self.getOper()
         lhs = expr
         rhs = self.parsePower(is_cond)
@@ -1145,19 +1278,12 @@ class Parser:
         if oper == "/":
             if expr.is_int:
                 warning("Integer divide")
-            factors = getParamFactors(expr.e2)
-            zero_factors = []
-            for pname in factors:
-                if not checkParameterRangeExclude(pname, 0) and not pname in zero_factors:
-                    if not checkConditionsExclude(pname, 0, self.ternary_condition):
-                        zero_factors.append(pname)
-            for pname in zero_factors:
-                warning("Possible division by zero for parameter %s" % pname)
+            self.checkExprZero(expr.e2)
     return expr
 
   def parseAdditive(self, is_cond):
     expr = self.parseMultiplicative(is_cond)
-    while self.peekOper() in [ "+", "-"]:
+    while self.peekOper() in ["+", "-"]:
         oper = self.getOper()
         lhs = expr
         rhs = self.parseMultiplicative(is_cond)
@@ -1503,20 +1629,20 @@ def format_char( chrnum ): # pragma: no cover
 
 # get value of constant expression
 def getSimpleValue(expr, m_or_l, char):
-    val = 0
+    value = 0
     valid = True
     if expr.type == "NOTHING":
         error("Expected constant expression for %s after '%s'" % (m_or_l, char))
         valid = False
     elif expr.type == "NUMBER":
-        val = expr.number
+        value = expr.number
     elif expr.type == "NAME":
         name = expr.e1
         if name in gParameters:
             gParameters[name].used = True
             defv = gParameters[name].defv
             if defv.type == "NUMBER":
-                val = defv.number
+                value = defv.number
             else:
                 warning("Cannot determine range %s from '%s'" % (m_or_l, name))
         else:
@@ -1528,17 +1654,33 @@ def getSimpleValue(expr, m_or_l, char):
             [e2, valid] = getSimpleValue(expr.e2, m_or_l, char)
         if valid:
             if expr.type == "+":
-                val = e1 + e2
+                value = e1 + e2
             elif expr.type == "-":
-                val = e1 - e2
+                value = e1 - e2
             elif expr.type == "*":
-                val = e1 * e2
+                value = e1 * e2
             elif expr.type == "/" and e2 != 0:
-                val = e1 / e2
+                value = e1 / e2
     else:
         warning("Cannot determine range %s from '%s'" % (m_or_l, expr.asString()))
-    return [val, valid]
+    return [value, valid]
     
+
+# get a numerical value for range (min/max)
+def getRangeValue(expr):
+    value = 0
+    valid = False
+    if expr.type == "NUMBER":
+        value = expr.number
+        valid = True
+    elif expr.type == "NAME" and expr.e1 == "inf":
+        value = 1e300
+        valid = True
+    elif expr.type == "-" and expr.e1.type == "NAME" and expr.e1.e1 == "inf":
+        value = -1e300
+        valid = True
+    return [value, valid]
+
 
 # get a list of all parameters that are multiplicative factors
 # (for checking division by zero)
@@ -1552,6 +1694,10 @@ def getParamFactors(expr):
     elif expr.type == "/":
         ret += getParamFactors(expr.e1)
         # denom checked when parsing this subexpression
+    elif expr.type == "FUNCCALL" and expr.e1 in ["sqrt", "$sqrt", "pow", "$pow",
+            "sin", "$sin", "asin", "$asin", "sinh", "$sinh", "asinh", "$asinh",
+            "tan", "$tan", "atan", "$atan", "tanh", "$tanh", "atanh", "$atanh"]:
+        ret += getParamFactors(expr.args[0])
     return ret
 
 
@@ -1669,6 +1815,15 @@ def checkConditionsExcludeOper( oper, e1, e2, negated, pname, exval, recurse ):
                 val_lt = True
             elif (oper == "<=" and not negated) or (oper == ">" and negated):
                 val_gt = True
+        elif e1.type == "FUNCCALL" and e1.e1 == "abs" and e2.type == "NUMBER" and e2.number > 0:
+            # abs(pname - exval) > val
+            arg = e1.args[0]
+            if arg.type in ["+", "-"] and arg.e1.type == "NAME" and arg.e1.e1 == pname and arg.e2.type == "NUMBER":
+                if (arg.type == "-" and arg.e2.number == exval) or (arg.type == "+" and arg.e2.number == -exval):
+                    if not negated and oper in [">", ">="]:
+                        excludes = True
+                    elif negated and oper in ["<", "<="]:
+                        excludes = True
         if val:
             if   val_eq:
                 if val.type == "NUMBER" and val.number == exval:
@@ -1798,7 +1953,7 @@ def checkFuncArgNoConditions(arg):
         if cond.type != "NOTHING":
             can_check = False
     if can_check:
-        if arg.type in ["+","-","*","/"]:
+        if arg.type in ["+","-","*","/"] and arg.e2:
             e1_can_be_neg = False
             e1_must_be_neg = False
             if arg.e1.type == "NAME" and arg.e1.e1 in gParameters:
@@ -1838,6 +1993,12 @@ def checkFuncArgNoConditions(arg):
                 elif arg.type == "*" or arg.type == "/":
                     if (e1_can_be_neg or e2_can_be_neg) and not (e1_must_be_neg and e2_must_be_neg):
                         allows = True
+        elif arg.type == "-" and not arg.e2: # unary -
+            if arg.e1.type == "NAME" and arg.e1.e1 in gParameters:
+                if not checkParamRangeNeg(arg.e1.e1, True):
+                    allows = True
+            elif arg.e1.type == "NUMBER" and arg.e1.number > 0:
+                allows = True
     return allows
 
 
@@ -6051,9 +6212,7 @@ class versionAction(argparse.Action):
         argparse.Action.__init__(self, option_strings=option_strings, dest=dest, nargs=nargs, help=help)
         return
     def __call__(self, parser, namespace, values, option_string=None):
-        print("""
-VAMPyRE version 1.8.2
-""")
+        print("\nVAMPyRE version %s\n" % gVersionNumber)
         sys.exit()
 
 
@@ -6088,6 +6247,8 @@ gStyle     = args.no_style
 gVerbose   = args.verbose
 if gFixIndent and not gStyle:
     fatal("Cannot fix indentation without checking style")
+if gVerbose:
+    print("VAMPyRE version %s" % gVersionNumber)
 initializeModule()
 parseFile(args.main_file)
 printModuleSummary()
