@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.6, 25-Nov-2020
+# version 1.7, 17-Dec-2020
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -473,8 +473,8 @@ class Expression:
         else: # unary +/-
             return self.type + "(" + self.e1.asString() + ")"
     elif self.type == "&&":
-        if self.e1.type in ["==", "!=", "<", ">", "<=", ">=", "&&", "||", "!", "NOT"] \
-                and self.e2.type in ["==", "!=", "<", ">", "<=", ">=", "&&", "||", "!", "NOT"]:
+        if self.e1.type in ["==", "!=", "<", ">", "<=", ">=", "&&", "||", "!", "NOT", "NAME", "NUMBER"] \
+                and self.e2.type in ["==", "!=", "<", ">", "<=", ">=", "&&", "||", "!", "NOT", "NAME", "NUMBER"]:
             # don't need extra ()
             return self.e1.asString() + "&&" + self.e2.asString()
         else:
@@ -965,11 +965,20 @@ class Parser:
                     allow_zero = False
                     if fname == "sqrt":
                         allow_zero = True
-                    if arg.type == "NAME" and arg.e1 in gParameters:
-                        pname = arg.e1
-                        if not checkParamRangePos(pname, allow_zero):
-                            if not checkConditionsRequirePositive(pname, allow_zero, self.ternary_condition):
-                                warning("Parameter range allows values not in domain of function '%s(%s)'" % (fname, pname))
+                    factors = getParamFactors(arg)
+                    if len(factors) > 0:
+                        for pname in factors:
+                            if not checkParamRangePos(pname, allow_zero):
+                                if not checkConditionsRequirePositive(pname, allow_zero, self.ternary_condition):
+                                    arg_str = arg.asString()
+                                    if allow_zero:
+                                        bad_val = "negative"
+                                    else:
+                                        bad_val = "non-positive"
+                                    if pname == arg_str:
+                                        warning("Parameter range allows %s argument for function '%s(%s)'" % (bad_val, fname, pname))
+                                    else:
+                                        warning("Range of parameter '%s' allows %s argument for function '%s()'" % (pname, bad_val, fname))
                     elif checkFuncArgNoConditions(arg):
                         warning("Parameter range(s) allow negative argument to function '%s(%s)'" % (fname, arg.asString()))
             elif fname in gUserFunctions:
@@ -1087,12 +1096,12 @@ class Parser:
         oper = self.getOper()
         do_warn = ""
         if self.peekOper() == "!":
-            do_warn = "!!"
+            do_warn = "!"
         arg = self.parsePrefix(is_cond)
         expr = Expression(oper)
         expr.e1 = arg
         if do_warn != "":
-            warning("Adjacent unary operators: '%s%s'" % (do_warn, expr.asString()))
+            warning("Adjacent unary operators: '%s%s'" % (do_warn, arg.asString()))
     elif oper == "~":             # Bitwise not
         oper = self.getOper()
         warning("Unexpected bitwise operator '%s'" % oper)
@@ -1128,8 +1137,8 @@ class Parser:
         if oper == "/":
             if expr.is_int:
                 warning("Integer divide")
-            if expr.e2.type == "NAME" and expr.e2.e1 in gParameters:
-                pname = expr.e2.e1
+            factors = getParamFactors(expr.e2)
+            for pname in factors:
                 if not checkParameterRangeExclude(pname, 0):
                     if not checkConditionsExclude(pname, 0, self.ternary_condition):
                         warning("Possible division by zero for parameter %s" % pname)
@@ -1395,9 +1404,9 @@ class Parser:
             val = self.lex()
             if self.isNumber():
                 num = self.getNumber()
-                if oper == ord('-'):
+                if oper == '-':
                     lsb -= num
-                elif oper == ord('+'):
+                elif oper == '+':
                     lsb += num
                 val = self.lex()
         if val != ord(']'): # pragma: no cover
@@ -1544,6 +1553,21 @@ def format_char( chrnum ): # pragma: no cover
     else:
         retstr = ("character '%s'" % chr(chrnum))
     return retstr
+
+
+# get a list of all parameters that are multiplicative factors
+# (for checking division by zero)
+def getParamFactors(expr):
+    ret = []
+    if expr.type == "NAME" and expr.e1 in gParameters:
+        ret.append(expr.e1)
+    elif expr.type == "*":
+        ret += getParamFactors(expr.e1)
+        ret += getParamFactors(expr.e2)
+    elif expr.type == "/":
+        ret += getParamFactors(expr.e1)
+        # denom checked when parsing this subexpression
+    return ret
 
 
 # check if parameter range excludes the value 'val'
@@ -1763,6 +1787,7 @@ def checkConditionsRequirePositive( pname, allow_zero, extra_cond ):
         requires |= checkConditionsRequirePosOper(extra_cond.type, extra_cond.e1, extra_cond.e2, False, pname, allow_zero, True)
     return requires
 
+
 # check if parameter ranges allow negative argument
 # (abort checking if conditions are in play, too hard to check in general)
 def checkFuncArgNoConditions(arg):
@@ -1781,9 +1806,10 @@ def checkFuncArgNoConditions(arg):
                     e1_can_be_neg = True
                 if checkParamRangeNeg(arg.e1.e1, False):
                     e1_must_be_neg = True
-            elif arg.e1.type == "NUMBER" and arg.e1.e1 < 0:
-                e1_can_be_neg = True
-                e1_must_be_neg = True
+            elif arg.e1.type == "NUMBER":
+                if arg.e1.number < 0:
+                    e1_can_be_neg = True
+                    e1_must_be_neg = True
             else:
                 can_check = False
             e2_can_be_neg = False
@@ -1795,10 +1821,10 @@ def checkFuncArgNoConditions(arg):
                 if checkParamRangeNeg(arg.e2.e1, False):
                     e2_must_be_neg = True
             elif arg.e2.type == "NUMBER":
-                if arg.e2.e1 < 0:
+                if arg.e2.number < 0:
                     e2_can_be_neg = True
                     e2_must_be_neg = True
-                elif arg.e2.e1 > 0:
+                elif arg.e2.number > 0:
                     e2_can_be_pos = True
             else:
                 can_check = False
@@ -2170,6 +2196,8 @@ def expandMacro( line ):
                     fatal("Macro `%s called with %d arguments, expected %d" % (name, len(actuals), len(args)))
             elif len(args) > 0:
                 error("Macro `%s called without arguments, expected %d" % (name, len(args)))
+            if len(text) > 0 and text[-1] == ';' and len(line) > i and line[i] == ';':
+                warning("Expansion of macro '%s' results in repeated ';'" % name)
             str = line[0:pos]
             str += text
             str += line[i:]
@@ -2481,6 +2509,8 @@ def parseModuleDecl( line ):
             error("Missing ')' after list of ports in module declaration")
     if val != ord(';'):
         error("Missing ';' at end of module declaration")
+    elif parser.peekChar() == ';':
+        error("Extra ';' at end of module declaration")
 # end of parseModuleDecl
 
 
@@ -2685,6 +2715,7 @@ def parseParamDecl( line, attribs ):
                     error("Parameter '%s' default value depends on unknown identifier '%s'" % (pname, dep))
 
         val = parser.lex()
+        parse_error = False
         while parser.isIdentifier():
             str = parser.getString()
             if ptype == "string":
@@ -2697,12 +2728,18 @@ def parseParamDecl( line, attribs ):
                         val = parser.lex()
                         if val == ord(','):
                             val = parser.lex()
+                    if parser.isNumber():
+                        parse_error = True
+                        error("Invalid number in range for string parameter")
+                        break
                 else:
+                    parse_error = True
                     error("Invalid %s in range" % format_char(val))
                     break
                 if val == ord('}'):
                     val = parser.lex()
                 else:
+                    parse_error = True
                     error("Invalid %s in range" % format_char(val))
                     break
             elif str == "from":
@@ -2713,6 +2750,7 @@ def parseParamDecl( line, attribs ):
                 elif val == ord('('):
                     lend = "o"
                 elif val == ord(';'):
+                    parse_error = True
                     error("Missing range after 'from'")
                     break
                 else:
@@ -2736,6 +2774,7 @@ def parseParamDecl( line, attribs ):
                 elif val == ord(')'):
                     rend = "o"
                 elif val == ord(';'):
+                    parse_error = True
                     error("Missing ')' or ']' in range")
                     break
                 else:
@@ -2775,7 +2814,10 @@ def parseParamDecl( line, attribs ):
                 fatal("Unexpected '%s' in parameter declaration" % str)
 
     if val != ord(';'):
-        error("Missing ';' at end of %s declaration" % parm_or_alias)
+        if not parse_error:
+            error("Missing ';' at end of %s declaration" % parm_or_alias)
+    elif parser.peekChar() == ';':
+        error("Extra ';' at end of %s declaration" % parm_or_alias)
 # end of parseParamDecl
 
 
@@ -2877,6 +2919,9 @@ def parseVariableDecl( line, attribs ):
             units = ""
             multi = ""
             val = parser.lex()
+            while val == ord(';'):
+                error("Extra ';' at end of variable declaration")
+                val = parser.lex()
         elif parser.isIdentifier():
             str = parser.getString()
             if str in ["inout", "input", "output", "real", "integer", "genvar"]:
@@ -2888,7 +2933,7 @@ def parseVariableDecl( line, attribs ):
         elif val != 0:
             error("Invalid %s in variable declaration" % format_char(val))
             val = parser.lex()
-    if line[-1:] != ';':
+    if line[-1] != ';':
         error("Missing ';' at end of variable declaration")
 # end of parseVariableDecl
 
@@ -3007,6 +3052,9 @@ def parsePortDirection( line ):
             ptype = ""
             bus_range = []
             val = parser.lex()
+            while val == ord(';'):
+                error("Extra ';' at end of port direction declaration")
+                val = parser.lex()
         elif parser.isIdentifier():
             str = parser.getString()
             if str in ["inout", "input", "output", "real", "integer"]:
@@ -3018,7 +3066,7 @@ def parsePortDirection( line ):
         elif val != 0:
             error("Invalid %s in port declaration" % format_char(val))
             val = parser.lex()
-    if line[-1:] != ';':
+    if line[-1] != ';':
         error("Missing ';' at end of port direction declaration")
 # end of parsePortDirection
 
@@ -3879,8 +3927,10 @@ def parseOther( line ):
                     this_cond = Expression("NOT")
                     this_cond.e1 = last_cond
                 this_c_bd = last_c_bd
-            else: # pragma: no cover
-                error("Programming error: 'else' condition")
+            else:
+                # this "else" corresponds to an "if" that's always true, eg if(1)
+                this_cond = Expression("NUMBER")
+                this_cond.number = 0
             val = parser.lex()
             if parser.isIdentifier():
                 keywd = parser.getString()
@@ -3891,10 +3941,17 @@ def parseOther( line ):
 
         if keywd == "if":
             new_cond = parser.getExpression(True)
-            deps = new_cond.getDependencies(False, False)
+            if new_cond.type == "NUMBER" and new_cond.number != 0:
+                # if (1)
+                new_cond = Expression("NOTHING")
+                deps = []
+            else:
+                deps = new_cond.getDependencies(False, False)
             [bias_dep, biases] = checkDependencies(deps, "If condition depends on", 0, True, True)
             if this_cond.type == "NOTHING":
                 this_cond = new_cond
+            elif new_cond.type == "NOTHING":
+                pass
             else:
                 old_cond = this_cond
                 this_cond = Expression("&&")
@@ -4195,6 +4252,9 @@ def parseOther( line ):
                     error("Missing ',' in list of nodes")
             if val == ord(';'):
                 val = parser.lex()
+                while val == ord(';'):
+                    error("Extra ';' after list of nodes")
+                    val = parser.lex()
             else:
                 error("Missing ';' after list of nodes")
 
@@ -4230,6 +4290,9 @@ def parseOther( line ):
                     error("Missing ',' in list of nodes")
             if val == ord(';'):
                 val = parser.lex()
+                while val == ord(';'):
+                    error("Extra ';' after list of nodes")
+                    val = parser.lex()
             else:
                 error("Missing ';' after list of nodes")
 
@@ -4295,6 +4358,9 @@ def parseOther( line ):
                 error("Missing name for branch declaration")
             if val == ord(';'):
                 val = parser.lex()
+                while val == ord(';'):
+                    error("Extra ';' after branch declaration")
+                    val = parser.lex()
             else:
                 error("Missing ';' after branch declaration")
 
@@ -4368,6 +4434,9 @@ def parseOther( line ):
                     val = parser.lex()
                     if val == ord(';'):
                         val = parser.lex()
+                        if val == ord(';'):
+                            error("Extra ';' after assignment")
+                            val = parser.lex()
                     else:
                         error("Missing ';' after assignment")
                     if parser.isIdentifier():
@@ -4500,6 +4569,9 @@ def parseOther( line ):
                             keywd = parser.getString()
                             if keywd in gAccessFuncs:
                                 style("Multiple contributions on a single line")
+                        elif val == ord(';'):
+                            error("Extra ';' after contribution")
+                            val = parser.lex()
                     else:
                         error("Missing ';' after contribution")
 
@@ -4538,6 +4610,9 @@ def parseOther( line ):
                             error("First argument to %s must be a string" % keywd)
                     if val == ord(';'):
                         val = parser.lex()
+                        if val == ord(';'):
+                            error("Extra ';' after task %s" % keywd)
+                            val = parser.lex()
                     else:
                         error("Missing ';' after task %s" % keywd)
                 else:
@@ -5683,7 +5758,7 @@ class versionAction(argparse.Action):
         return
     def __call__(self, parser, namespace, values, option_string=None):
         print("""
-VAMPyRE version 1.6
+VAMPyRE version 1.7
 """)
         sys.exit()
 
