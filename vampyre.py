@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.3, 21-Aug-2020
+# version 1.4, 26-Oct-2020
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
 # 2) unused parameters or variables
 # 3) division by zero for parameters (1/parm where parm's range allows 0)
+#    or domain errors for ln() and sqrt()
 # 4) integer division (1/2 = 0)
 # 5) incorrect ddx() usage
 # 6) ports without direction and/or discipline
@@ -40,6 +41,7 @@
 import os
 import sys
 import argparse
+from copy import deepcopy
 
 ################################################################################
 # global variables
@@ -75,6 +77,7 @@ gMaxNum        = 5
 gSpcPerInd     = 4
 gStyle         = False
 gVerbose       = False
+gBinning       = False
 
 # dictionaries to track how many of each type of message
 gErrorMsgDict   = {}
@@ -142,6 +145,9 @@ gVAMScompdir = [
     "endcelldefine", "endif", "ifdef", "ifndef", "include", "line",
     "nounconnected_drive", "pragma", "resetall", "timescale",
     "unconnected_drive", "undef"]
+
+# hierarchical system parameters from VAMS LRM Section 6.3.6
+gVAMShiersysparm = ["$xposition", "$yposition", "$angle", "$hflip", "$vflip"]
 
 # math functions and number of arguments
 gMathFunctions = { "abs": 1, "limexp": 1, "log": 1, "$log10":1, "min": 2, "max": 2 }
@@ -950,6 +956,20 @@ class Parser:
                           % (len(args), fname, nargs))
                 if fname == "log":
                     warning("Found base-10 log(); use ln() for natural log")
+                elif (fname == "ln" or fname == "sqrt") and len(args) == 1:
+                    arg = args[0]
+                    if arg.type == "NAME" and arg.e1 in gParameters:
+                        pname = arg.e1
+                        check_cond = False
+                        allow_zero = False
+                        if fname == "ln" and not checkParamRangePos(pname, False):
+                            check_cond = True
+                        elif fname == "sqrt" and not checkParamRangePos(pname, True):
+                            check_cond = True
+                            allow_zero = True
+                        if check_cond:
+                            if not checkConditionsRequirePositive(pname, allow_zero, self.ternary_condition):
+                                warning("Possible invalid function call for '%s(%s)'" % (fname, pname))
             elif fname in gUserFunctions:
                 if gUserFunctions[fname].type == "integer":
                     expr.is_int = True
@@ -1535,7 +1555,7 @@ def checkParameterRangeExclude( pname, val ):
 
 def checkParamRangePos( pname, allow_zero ):
     parm = gParameters[pname]
-    if parm.min.type == "NUMBER":
+    if parm.range != "nb" and parm.min.type == "NUMBER":
         a = parm.min.number
         if parm.range == "cc" or parm.range == "co":
             # from [a:inf), a>0
@@ -1545,11 +1565,12 @@ def checkParamRangePos( pname, allow_zero ):
             # from (a:inf), a>=0
             if a >= 0:
                 return True
+    return False
 
 
 def checkParamRangeNeg( pname, allow_zero ):
     parm = gParameters[pname]
-    if parm.max.type == "NUMBER":
+    if parm.range != "nb" and parm.max.type == "NUMBER":
         b = parm.max.number
         if parm.range == "cc" or parm.range == "oc":
             # from (-inf:b], b<0
@@ -1559,6 +1580,7 @@ def checkParamRangeNeg( pname, allow_zero ):
             # from (-inf:b), b<=0
             if b <= 0:
                 return True
+    return False
 
 
 # recursive!
@@ -1592,7 +1614,7 @@ def checkConditionsExcludeOper( oper, e1, e2, negated, pname, exval, recurse ):
                 val_ne = True
             elif (oper == "!=" and not negated) or (oper == "==" and negated):
                 val_eq = True
-            if   (oper == ">"  and not negated) or (oper == "<=" and negated):
+            elif (oper == ">"  and not negated) or (oper == "<=" and negated):
                 val_le = True
             elif (oper == "<"  and not negated) or (oper == ">=" and negated):
                 val_ge = True
@@ -1656,6 +1678,67 @@ def checkConditionsExclude( pname, exval, extra_cond ):
         # ternary condition
         excludes |= checkConditionsExcludeOper(extra_cond.type, extra_cond.e1, extra_cond.e2, False, pname, exval, True)
     return excludes
+
+
+# recursive!
+def checkConditionsRequirePosOper( oper, e1, e2, negated, pname, allow_zero, recurse ):
+    requires = False
+    if oper in [">=", ">", "<=", "<"]:
+        val_gt = False
+        val_ge = False
+        val = 0
+        if e1.type == "NAME" and pname == e1.e1:
+            # PAR > val, PAR >= val
+            val = e2
+            if   (oper == ">"  and not negated) or (oper == "<=" and negated):
+                val_ge = True
+            elif (oper == ">=" and not negated) or (oper == "<" and negated):
+                val_gt = True
+        elif e2.type == "NAME" and pname == e2.e1:
+            # val < PAR, val <= PAR
+            val = e1
+            if   (oper == "<"  and not negated) or (oper == ">=" and negated):
+                val_ge = True
+            elif (oper == "<=" and not negated) or (oper == ">" and negated):
+                val_gt = True
+        if val:
+            if val_ge:
+                if val.type == "NUMBER" and val.number >= 0:
+                    requires = True
+                elif val.type == "NAME" and val.e1 in gParameters:
+                    if checkParamRangePos(val.e1, True):
+                        requires = True
+            elif val_gt:
+                if val.type == "NUMBER" and (val.number > 0 or (allow_zero and val.number == 0)):
+                    requires = True
+                elif val.type == "NAME" and val.e1 in gParameters:
+                    if checkParamRangePos(val.e1, allow_zero):
+                        requires = True
+
+    elif oper == "&&" and not negated:
+        c1 = checkConditionsRequirePosOper(e1.type, e1.e1, e1.e2, negated, pname, allow_zero, False)
+        c2 = checkConditionsRequirePosOper(e2.type, e2.e1, e2.e2, negated, pname, allow_zero, False)
+        requires = c1 or c2
+    elif oper == "||" and negated and recurse: # else of (c1 || c2)
+        c1 = checkConditionsRequirePosOper(e1.type, e1.e1, e1.e2, negated, pname, allow_zero, False)
+        c2 = checkConditionsRequirePosOper(e2.type, e2.e1, e2.e2, negated, pname, allow_zero, False)
+        requires = c1 or c2
+    elif oper == "!" or oper == "NOT":
+        requires = checkConditionsRequirePosOper(e1.type, e1.e1, e1.e2, not negated, pname, allow_zero, True)
+    return requires
+
+
+# check if conditions in effect require positive parameter value
+def checkConditionsRequirePositive( pname, allow_zero, extra_cond ):
+    global gConditions
+    requires = False
+    for cond in gConditions:
+        if cond.type != "NOTHING":
+            requires |= checkConditionsRequirePosOper(cond.type, cond.e1, cond.e2, False, pname, allow_zero, True)
+    if extra_cond.type != "NOTHING":
+        # ternary condition
+        requires |= checkConditionsRequirePosOper(extra_cond.type, extra_cond.e1, extra_cond.e2, False, pname, allow_zero, True)
+    return requires
 
 
 def checkIdentifierCollisions( basename, name, escaped, type ):
@@ -1747,6 +1830,9 @@ def getAttributes( line ):
                 while i < len(attrib) and (attrib[i].isalpha() or attrib[i] == '_'):
                     name += attrib[i]
                     i += 1
+                while i < len(attrib) and (attrib[i].isalnum() or attrib[i] == '_'):
+                    name += attrib[i]
+                    i += 1
                 if do_append:
                     retval.append(name)
                 while i < len(attrib) and attrib[i].isspace():
@@ -1758,9 +1844,15 @@ def getAttributes( line ):
                     while i < len(attrib) and attrib[i].isspace():
                         i += 1
                     in_quote = False
-                    while i < len(attrib) and (in_quote or attrib[i] != ','):
+                    in_brace = 0
+                    while i < len(attrib) and (in_quote or in_brace or attrib[i] != ','):
                         if attrib[i] == '"':
                             in_quote = not in_quote
+                        if not in_quote:
+                            if attrib[i] == '{':
+                                in_brace += 1
+                            elif attrib[i] == '}':
+                                in_brace -= 1
                         value += attrib[i]
                         i += 1
                     value = value.strip()
@@ -2553,6 +2645,9 @@ def parseParamDecl( line, attribs ):
                 exclude = parser.getExpression()
                 if exclude.type == "NUMBER":
                     parm.exclude.append(exclude.number)
+                elif exclude.type == "NAME":
+                    if not exclude.e1 in gParameters:
+                        warning("Parameter range 'exclude %s' is not valid" % exclude.e1)
                 elif exclude.type == "NOTHING":
                     error("Missing value for 'exclude'")
                 else:
@@ -2871,7 +2966,7 @@ def checkPorts():
 
 
 def checkParmsAndVars():
-    global gFileName, gLineNo, gDebug
+    global gFileName, gLineNo
     temp = gVariables["$temperature"]
     has_tref = False
     has_dtemp = False
@@ -3093,6 +3188,9 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, do_war
         if not is_set and do_warn:
             if dep in gVAMSkeywords:
                 error("%s Verilog-AMS keyword '%s'" % (unset_message, dep))
+            # $xposition, $yposition, $angle, $hflip, $vflip
+            elif dep in gVAMShiersysparm:
+                warning("%s hierarchical system parameter '%s'" % (unset_message, dep))
             else:
                 error("%s %s, which has not been set" % (unset_message, dep))
     return [bias_dep, biases]
@@ -3322,6 +3420,165 @@ def markVariableAsSet( varname, bias_dep_in, cond_in, biases_in, for_var, set_by
             error("Assignment to '%s' which is not a variable" % varname)
     return found
 # end of markVariableAsSet
+
+
+# try to parse term as something like L{pname} * Inv_L
+def checkBinningTerm(t_in, pname):
+    term = deepcopy(t_in) # term may be modified below
+    fact = ""
+    pfx  = ""
+    sfx  = ""
+    oper = "*"
+    if term.type == "*":
+        # consider Inv_L * Inv_W * P{param}
+        if term.e1.type == "*" and term.e2.type == "NAME":
+            if term.e1.e1.type == "NAME" and term.e1.e2.type == "NAME":
+                if term.e2.e1 in gParameters:
+                    term.e1.type = "NAME"
+                    term.e1.e1 = term.e1.e1.e1 + "*" + term.e1.e2.e1
+                elif term.e1.e1.e1 in gParameters:
+                    sparm = term.e1.e1.e1
+                    term.e1.type = "NAME"
+                    term.e1.e1 = term.e1.e2.e1 + "*" + term.e2.e1
+                    term.e2.e1 = sparm
+                elif term.e1.e2.e1 in gParameters:
+                    sparm = term.e1.e2.e1
+                    term.e1.type = "NAME"
+                    term.e1.e1 = term.e1.e1.e1 + "*" + term.e2.e1
+                    term.e2.e1 = sparm
+        elif term.e2.type == "*" and term.e1.type == "NAME":
+            if term.e2.e1.type == "NAME" and term.e2.e2.type == "NAME":
+                if term.e1.e1 in gParameters:
+                    term.e2.type = "NAME"
+                    term.e2.e1 = term.e2.e1.e1 + "*" + term.e2.e2.e1
+                elif term.e2.e1.e1 in gParameters:
+                    sparm = term.e2.e1.e1
+                    term.e2.type = "NAME"
+                    term.e2.e1 = term.e2.e2.e1 + "*" + term.e1.e1
+                    term.e1.e1 = sparm
+                elif term.e2.e2.e1 in gParameters:
+                    sparm = term.e2.e2.e1
+                    term.e2.type = "NAME"
+                    term.e2.e1 = term.e2.e1.e1 + "*" + term.e1.e1
+                    term.e1.e1 = sparm
+    if term.type == "/":
+        # consider 1.0e-6 * LXL / L
+        if term.e1.type == "*" and term.e2.type == "NAME" and (term.e2.e1 == "L" or term.e2.e1 == "W"):
+            if term.e1.e1.type == "NUMBER" and term.e1.e2.type == "NAME" and term.e1.e2.e1 in gParameters:
+                # convert to 1.0e-6 / L * LXL
+                term.type = "*"
+                term.e1.type = "/"
+                lparm = term.e2 # L or W
+                term.e2 = term.e1.e2
+                term.e1.e2 = lparm
+        # consider PXL * 1.0e-6 / (L * NFIN)
+        if term.e1.type == "*" and term.e2.type == "*":
+            if term.e1.e1.type == "NAME" and term.e1.e1.e1 in gParameters and term.e1.e2.type == "NUMBER":
+                if term.e2.e1.type == "NAME" and term.e2.e2.type == "NAME":
+                    # convert to PXL * (1.0e-6 / (L * NFIN))
+                    newfact = Expression("/")
+                    newfact.e1 = term.e1.e2
+                    newfact.e2 = term.e2
+                    term.type = "*"
+                    term.e1 = term.e1.e1
+                    term.e2 = newfact
+    if (term.type == "*" or term.type == "/") and (term.e1.type == "NAME" or term.e2.type == "NAME"):
+        sname = ""
+        oper = term.type
+        if term.e1.type == "NAME" and term.e1.e1 in gParameters:
+            sname = term.e1.e1
+            fact = term.e2.asString()
+        elif term.e2.type == "NAME" and term.e2.e1 in gParameters:
+            sname = term.e2.e1
+            fact = term.e1.asString()
+        if sname != "":
+            if sname[1:] == pname:
+                pfx = sname[0]
+            elif (pname[-1].lower() == 'o' or pname[-1] == '0') \
+                and pname[:-1] == sname[0:len(pname)-1]:
+                sfx = sname[len(pname)-1:]
+            elif pname[0:2].lower() == 'po' and pname[2:] == sname[len(sname)-len(pname)+2:]:
+                pfx = sname[0:2]
+    return [fact, oper, pfx, sfx]
+# end of checkBinningTerm
+
+# keep track of binning equation patterns
+gBinningPatterns = [[],[]]
+
+def checkBinning(vname, t0, t1, t2, t3, line):
+    global gBinningPatterns, gFileName, gLineNo
+    if t0.type == "NAME" and t0.e1 in gParameters:
+        pname = t0.e1
+        pname_l = pname.lower()
+        plen = len(pname)
+        vname_l = vname.lower()
+        vlen = len(vname)
+        vpfx = ""
+        vsfx = ""
+        pfx0 = ""
+        sfx0 = ""
+        if vlen > plen:
+            if vname_l[0:plen] == pname_l:
+                # VFB_i = VFB + ...
+                vsfx = vname[plen:]
+            elif vname_l[vlen-plen:] == pname_l:
+                # pParam_VFB = VFB + ...
+                vpfx = vname[0:vlen-plen]
+            elif (pname_l[-1] == 'o' or pname_l[-1] == '0') \
+                and pname_l[:-1] == vname_l[0:plen-1]:
+                # VFB_i = VFBO + ...
+                vsfx = vname[plen-1:]
+                sfx0 = pname[-1]
+        elif vlen < plen and (pname_l[-1] == 'o' or pname_l[-1] == '0') \
+            and pname_l[:-1] == vname_l:
+            # KUOWE = KUOWEO + ...
+            vpfx = "NONE"
+            sfx0 = pname[-1]
+        elif pname_l[0:2] == 'po' and pname_l[2:] == vname_l[0:plen-2]:
+            vsfx = vname[plen-2:]
+            pfx0 = pname[0:2]
+            if vsfx == "":
+                vsfx = "NONE"
+        [fact1, op1, pfx1, sfx1] = checkBinningTerm(t1, pname)
+        [fact2, op2, pfx2, sfx2] = checkBinningTerm(t2, pname)
+        [fact3, op3, pfx3, sfx3] = checkBinningTerm(t3, pname)
+        warned = False
+        if fact1 != "" and fact2 != "" and fact3 != "":
+            if pfx1+sfx1 != "" and pfx2+sfx2 != "" and pfx3+sfx3 != "":
+                if gBinning and vpfx == "" and vsfx == "":
+                    warning("Did not find parameter name '%s' in binning variable name '%s'" % (pname, vname))
+                    warned = True
+            elif pfx1+sfx1 == "" and (pfx2+sfx2 != "" or pfx3+sfx3 != ""):
+                warning("Binning equation to set '%s' involves '%s'" % (vname, t1.asString()))
+                warned = True
+            elif pfx2+sfx2 == "" and (pfx1+sfx1 != "" or pfx3+sfx3 != ""):
+                warning("Binning equation to set '%s' involves '%s'" % (vname, t2.asString()))
+                warned = True
+            elif pfx3+sfx3 == "" and (pfx1+sfx1 != "" or pfx2+sfx2 != ""):
+                warning("Binning equation to set '%s' involves '%s'" % (vname, t3.asString()))
+                warned = True
+        new_pat = [vpfx+vsfx, pfx0+sfx0, fact1+op1, pfx1+sfx1, fact2+op2, pfx2+sfx2, fact3+op3, pfx3+sfx3]
+        if len(gBinningPatterns[0]) == 0:
+            if (vpfx != "" or vsfx != "") and (pfx1+sfx1 != "" or pfx2+sfx2 != "" or pfx3+sfx2 != ""):
+                gBinningPatterns[0] = [gFileName[-1], gLineNo[-1]] + new_pat
+                if gBinning and (gVerbose or gDebug):
+                    if fact3 == "":
+                        t3 = "0"
+                    else:
+                        t3 = pfx3 + "[par]" + sfx3 + " " + op3 + " " + fact3
+                    print("Binning pattern: %s[par]%s = %s[par]%s + %s[par]%s %s %s + %s[par]%s %s %s + %s" \
+                          % (vpfx, vsfx, pfx0, sfx0, pfx1, sfx1, op1, fact1, pfx2, sfx2, op2, fact2, t3))
+                    if gDebug:
+                        print("  derived from %s" % line)
+        elif gBinning and not warned:
+            matched = False
+            for old_pat in gBinningPatterns:
+                if old_pat[2:] == new_pat:
+                    matched = True
+            if not matched:
+                warning("Binning equation does not match that on line %d of %s" % (gBinningPatterns[0][1], gBinningPatterns[0][0]))
+                gBinningPatterns.append( [gFileName[-1], gLineNo[-1]] + new_pat )
+# end of checkBinning
 
 
 # for if and while
@@ -3907,6 +4164,16 @@ def parseOther( line ):
                     deps = rhs.getDependencies(True, False)
                     [bias_dep, biases] = checkDependencies(deps, "Variable %s depends on" % varname, this_c_bd, False, True)
                     found = markVariableAsSet(varname, bias_dep, this_cond, biases, False, False, "", 0)
+                    if rhs.type == "+" and (rhs.e1.type == "+" or rhs.e2.type == "+"):
+                        # possible binning equation P_i = P + LP*Inv_L + WP*Inv_W + PP*Inv_P
+                        t3 = rhs.e2
+                        if rhs.e1.type == "+" and (t3.type == "*" or t3.type == "/"):
+                            t2 = rhs.e1.e2
+                            if rhs.e1.e1.type == "+" and (t2.type == "*" or t2.type == "/"):
+                                t1 = rhs.e1.e1.e2
+                                t0 = rhs.e1.e1.e1
+                                if t0.type == "NAME" and (t1.type == "*" or t1.type == "/"):
+                                    checkBinning(varname, t0, t1, t2, t3, line)
                     val = parser.lex()
                     if val == ord(';'):
                         val = parser.lex()
@@ -3923,11 +4190,16 @@ def parseOther( line ):
                             parseOther(rest)
                             this_cond = gConditionForLastStmt
                             this_c_bd = gCondBiasDForLastStmt
+                        elif keywd == "if":
+                            parser.ungetChars("if")
+                            if gStyle:
+                                style("Multiple statements on a single line")
                         elif gStyle and not all_zero_assigns:
                             style("Multiple assignments on a single line")
                         if parser.peekChar() == '[':
                             parser.checkBusIndex(keywd)
-                        val = parser.lex()
+                        if keywd != "if":
+                            val = parser.lex()
                 val = parser.lex()
                 if val == 0 and keywd != "":
                     if keywd == "end":
@@ -4045,6 +4317,8 @@ def parseOther( line ):
                     gStatementInCurrentBlock = True
                     if keywd in ["$finish", "$stop"]:
                         notice("$error() preferred over %s()" % keywd)
+                    elif keywd == "$debug":
+                        warning("%s() may degrade performance" % keywd)
 
                     args = parser.parseArgList()
                     deps = []
@@ -4953,6 +5227,8 @@ def parseFile( filename ):
                                         optional_indent = 0
                                         required_indent += gSpcPerInd
                                         single_line_indent = 0
+                                    elif str == "end":
+                                        required_indent -= gSpcPerInd
                                 elif val == ord('('):
                                     num_parens += 1
                                 elif val == ord(')'):
@@ -5216,7 +5492,7 @@ class versionAction(argparse.Action):
         return
     def __call__(self, parser, namespace, values, option_string=None):
         print("""
-VAMPyRE version 1.3
+VAMPyRE version 1.4
 """)
         sys.exit()
 
@@ -5228,6 +5504,7 @@ VAMPyRE version 1.3
 parser = argparse.ArgumentParser(description='Parse and run basic checks on Verilog-A models')
 parser.add_argument('main_file',             help='name of top-level Verilog-A file')
 parser.add_argument('-a', '--all',           help='equivalent to --max_num 0', action='store_true')
+parser.add_argument('-b', '--binning',       help='analyze binning equations', action='store_true')
 parser.add_argument('-d', '--debug',         help='turn on debug mode', action='store_true')
 parser.add_argument('-f', '--fix_indent',    help='fix indentation problems', action='store_true')
 parser.add_argument('-i', '--info',          help='print detailed usage information', action=infoAction, nargs=0)
@@ -5240,6 +5517,7 @@ parser.add_argument(      '--version',       help='print version number', action
 args       = parser.parse_args()
 gIncDir    = args.inc_dir
 gDebug     = args.debug
+gBinning   = args.binning
 gFixIndent = args.fix_indent
 if args.all:
     gMaxNum = 0
