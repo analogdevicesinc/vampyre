@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.8.6, 22-Nov-2021
+# version 1.8.7, 09-Mar-2022
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
 #    or conditionally-assigned operating point values
-# 2) unused parameters or variables
+# 2) unused parameters, variables, ports, or nodes
 # 3) division by zero for parameters (1/parm where parm's range allows 0)
 #    or domain errors for ln() and sqrt()
 # 4) integer division (1/2 = 0)
@@ -24,7 +24,7 @@
 #13) various problems with binning equations
 #14) nonlinear ddt() expressions
 #
-# Copyright (c) 2021 Analog Devices, Inc.
+# Copyright (c) 2022 Analog Devices, Inc.
 #
 # Licensed under Educational Community License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License. You may
@@ -49,7 +49,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.8.6"
+gVersionNumber = "1.8.7"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -84,6 +84,7 @@ gSpcPerInd     = 4
 gStyle         = False
 gVerbose       = False
 gBinning       = False
+gPrDefVals     = False
 
 # dictionaries to track how many of each type of message
 gErrorMsgDict   = {}
@@ -259,6 +260,7 @@ class Port:
     self.is_bus = False
     self.msb = 0
     self.lsb = 0
+    self.used = False
 
 class Branch:
   def __init__(self, name):
@@ -268,14 +270,14 @@ class Branch:
     self.discipline = "" # electrical, thermal, ...
     self.lhs_flow = 0    # flow contrib: 0=no, 1=yes, 2=bias-dep condition
     self.lhs_pot  = 0    # potential contrib: 0=no, 1=yes, 2=bias-dep condition
-    #self.rhs_flow = 0    # flow probe
-    #self.rhs_pot  = 0    # potential probe
+    self.used = False
 
 class Macro:
   def __init__(self, name, text):
     self.name = name
     self.text = text
     self.args = []
+    self.used = False        # whether used
 
 class Function:
   def __init__(self, name, type):
@@ -318,10 +320,13 @@ class Expression:
                 nname2 = ""
                 if nname1 in gPortnames:
                     dname = gPortnames[nname1].discipline
+                    gPortnames[nname1].used = True
                 elif nname1 in gNodenames:
                     dname = gNodenames[nname1].discipline
+                    gNodenames[nname1].used = True
                 elif nname1 in gBranches:
                     dname = gBranches[nname1].discipline
+                    gBranches[nname1].used = True
                 else:
                     dname = ""
                 if dname in gDisciplines:
@@ -350,8 +355,10 @@ class Expression:
                     dname2 = ""
                     if nname2 in gPortnames:
                         dname2 = gPortnames[nname2].discipline
+                        gPortnames[nname2].used = True
                     elif nname2 in gNodenames:
                         dname2 = gNodenames[nname2].discipline
+                        gNodenames[nname2].used = True
                     if dname2 != "" and dname2 != dname and not branch_contrib:
                         # if branch_contrib, error was reported already
                         error("Nodes '%s' and '%s' belong to different disciplines" % (nname1, nname2))
@@ -614,6 +621,17 @@ class Expression:
     elif self.type in ["?:"]:
         return "(" + self.e1.asString() + ")?(" +  self.e2.asString() \
                + "):(" + self.e3.asString() + ")"
+    elif self.type == "ARRAY":
+        ret = "'{"
+        first = True
+        for arg in self.args:
+            if first:
+                first = False
+            else:
+                ret += ","
+            ret += arg.asString()
+        ret += "}"
+        return ret
     elif self.type == "EVENT":
         ret = "@("
         first = True
@@ -1773,6 +1791,7 @@ def print_list( keys, start, maxlen ):
         if outstr == start:
             outstr += item
         elif len(outstr) + len(item) + 2 > maxlen:
+            outstr += ","
             print(outstr)
             outstr = start + item
         else:
@@ -2234,21 +2253,62 @@ def checkIdentifierCollisions( basename, name, escaped, type ):
     return valid
 
 
-def getAttributes( line ):
+def getAttributes( line, in_attrib ):
     retval = []
     do_append = True
-    start = line.find("(*")
-    while start >= 0:
+    had_comma = False
+    got_attrib = False
+    if in_attrib == "":
+        start  = line.find("(*")
+        start2 = start + 2
+    else:
+        start  = 0
+        start2 = 0
+    stop = line.find("*)")
+    if stop == 0:
+        line = line[stop+2:]
+        line = line.strip()
+        if len(line) > 0 and line[0] == ';':
+            warning("Attribute should prefix the item to which it applies")
+        start = line.find("(*")
+        start2 = start + 2
         stop = line.find("*)")
+        in_attrib = ""
+    if start >=0 and stop < 0:
+        # attribute continues on next line
+        retval = [" "]
+    else:
+        retval = [""]
+    while start >= 0:
         semi = line.find(";")
         if semi >= 0 and semi < start:
             do_append = False
             error("Attribute found after ';', please add line break")
-        if stop > start:
-            attrib = line[start+2:stop]
-            attrib = attrib.strip()
-            line = line[:start] + line[stop+2:]
+        stop = line.find("*)")
+        if stop >= 0:
+            i = stop+2
+            got_other = False
+            while i < len(line) and line[i].isspace():
+                i += 1
+            if i < len(line) and line[i] == ';':
+                warning("Attribute should prefix the item to which it applies")
+        if stop > start or stop == -1:
+            if stop == -1:
+                attrib = line[start2:]
+                line = line[:start]
+            else:
+                attrib = line[start2:stop]
+                line = line[:start] + line[stop+2:]
             line = line.strip()
+            attrib = attrib.strip()
+            if attrib != "":
+                if in_attrib == " ":
+                    if attrib[0] != ',':
+                        error("Missing ',' in attribute list")
+                elif attrib[0] == ',':
+                    if in_attrib == ',' or in_attrib == "":
+                        error("Extra comma before attributes")
+                        attrib = attrib[1:]
             i = 0
             while i < len(attrib):
                 while i < len(attrib) and attrib[i].isspace():
@@ -2260,48 +2320,68 @@ def getAttributes( line ):
                 while i < len(attrib) and (attrib[i].isalnum() or attrib[i] == '_'):
                     name += attrib[i]
                     i += 1
+                if name == "":
+                    error("Missing name for attribute")
                 if do_append:
                     retval.append(name)
                 while i < len(attrib) and attrib[i].isspace():
                     i += 1
+                got_attrib = True
+                get_value = False
                 value = ""
-                if i < len(attrib) and attrib[i] == '=':
+                if i < len(attrib):
+                    if attrib[i] == '=':
+                        i += 1
+                        get_value = True
+                    elif attrib[i] == '"':
+                        error("Missing '=' before value for attribute '%s'" % name)
+                        get_value = True
+                if get_value:
                     # (* name = value *)
-                    i += 1
-                    while i < len(attrib) and attrib[i].isspace():
-                        i += 1
-                    in_quote = False
-                    in_brace = 0
-                    while i < len(attrib) and (in_quote or in_brace or attrib[i] != ','):
-                        if attrib[i] == '"':
-                            in_quote = not in_quote
-                        if not in_quote:
-                            if attrib[i] == '{':
-                                in_brace += 1
-                            elif attrib[i] == '}':
-                                in_brace -= 1
-                        value += attrib[i]
-                        i += 1
-                    value = value.strip()
+                    parser = Parser(attrib[i:])
+                    expr = parser.getExpression()
+                    if expr.type != "NOTHING":
+                        value = expr.asString()
+                    i = len(attrib)-len(parser.getRestOfLine())
+                    if value == "":
+                        error("Missing value for attribute '%s'" % name)
                 # else:
                 #     (* name *)
                 if do_append:
                     retval.append(value)
+                had_comma = False
                 if i < len(attrib):
                     if attrib[i] == ',':
+                        had_comma = True
                         i += 1
+                        while i < len(attrib) and attrib[i].isspace():
+                            i += 1
+                            if attrib[i] == ',':
+                                error("Extra comma in attributes")
+                                i += 1
                     elif attrib[i] == ';' and name == "inherited_mfactor":
                         error("Archaic attribute syntax: %s" % attrib)
                         i += 1
-                    elif value == "":
-                        if attrib[i].isalnum():
+                    elif attrib[i].isalnum() or attrib[i] == '_':
+                        if value == "":
                             error("Missing '=' or ',' in attribute")
                         else:
-                            error("Unexpected character '%s' in attribute" % attrib[i])
-                            i += 1
+                            error("Missing ',' in attribute list")
+                    else:
+                        error("Unexpected character '%s' in attribute" % attrib[i])
+                        i += 1
         else: # pragma: no cover
             fatal("Malformed attribute")
         start = line.find("(*")
+        start2 = start + 2
+    if had_comma:
+        if retval[0] == " ":
+            retval[0] = ","
+        else:
+            error("Extra comma at end of attributes")
+    elif retval[0] == " " and got_attrib == False:
+        # (* by itself on a line, pretend we got a comma
+        retval[0] = ","
     retval.insert(0, line)
     return retval
 
@@ -2363,6 +2443,11 @@ def parseMacro( line ):
                 mac = Macro(name, value)
                 mac.args = args
                 gMacros[name] = mac
+                filename = gFileName[-1]
+                if filename.find("disciplines.vams") >= 0 or filename.find("discipline.h") >= 0 \
+                        or filename.find("constants.vams") >= 0 or filename.find("constants.h") >= 0:
+                    # don't complain about unused macros from standard header files
+                    mac.used = True
         else:
             error("Missing macro name after `define")
 
@@ -2474,6 +2559,7 @@ def expandMacro( line ):
             name += line[i]
             i += 1
         if name in gMacros:
+            gMacros[name].used = True
             text = gMacros[name].text
             args = gMacros[name].args
             if i < len(line) and line[i] == '(' and len(args) > 0:
@@ -2805,8 +2891,10 @@ def initializeModule():
 
     # predefined macros
     mac1 = Macro("__VAMS_ENABLE__", "1")
+    mac1.used = True
     gMacros["__VAMS_ENABLE__"]           = mac1
     mac2 = Macro("__VAMS_COMPACT_MODELING__", "1")
+    mac2.used = True
     gMacros["__VAMS_COMPACT_MODELING__"] = mac2
 
     # $temperature, $vt, $mfactor, $abstime
@@ -2822,6 +2910,24 @@ def initializeModule():
     atime = Variable("$abstime", "real", False, "", 0)
     atime.assign = -2
     gVariables[atime.name] = atime
+
+
+# print parameter defaults
+def printParamDefaults(plist):
+    for p in plist:
+        defv = gParameters[p].defv
+        if defv.type == "NUMBER":
+            defv = defv.asString()
+        elif defv.type == "NAME":
+            pname = defv.e1
+            if pname in gParameters:
+                defv = gParameters[pname].defv.asString()
+            else:
+                # should have been caught during parsing
+                defv = "UNKNOWN"
+        else:
+            defv = defv.asString()
+        print("    %s = %s" % (p, defv))
 
 
 # print summary
@@ -2844,17 +2950,24 @@ def printModuleSummary():
                 print_list(InstParms.keys(), "    ", 70)
             else:
                 print("\nInstance parameters (%d)" % len(InstParms))
+            if gPrDefVals:
+                printParamDefaults(InstParms)
             if gVerbose or len(ModelParms) < 20:
                 print("\nModel parameters (%d):" % len(ModelParms))
                 print_list(ModelParms.keys(), "    ", 70)
             else:
                 print("\nModel parameters (%d)" % len(ModelParms))
+            if gPrDefVals:
+                printParamDefaults(ModelParms)
         else:
             if gVerbose or len(gParameters) < 40:
                 print("\nParameters (%d):" % len(gParameters))
                 print_list(gParameters.keys(), "    ", 70)
             else:
                 print("\nParameters (%d)" % len(gParameters))
+            if gPrDefVals:
+                print("Default values:")
+                printParamDefaults(gParameters)
 
     if len(gVariables):
         OpPtVars = {}
@@ -3341,7 +3454,7 @@ def parseVariableDecl( line, attribs ):
             str = parser.getString()
             if str in ["inout", "input", "output", "real", "integer", "genvar"]:
                 error("Missing ';' after list of variables")
-                vtype = str;
+                vtype = str
                 val = parser.lex()
             else:
                 error("Missing ',' in list of variables")
@@ -3557,6 +3670,31 @@ def checkParmsAndVars():
     not_upper = []
     some_units = False
     param_names_lower = []
+    for branch in gBranches.values():
+        n1 = branch.node1
+        n2 = branch.node2
+        if n1 in gPortnames:
+            gPortnames[n1].used = True
+        elif n1 in gNodenames:
+            gNodenames[n1].used = True
+        if n2 in gPortnames:
+            gPortnames[n2].used = True
+        elif n2 in gNodenames:
+            gNodenames[n2].used = True
+    for port in gPortnames.values():
+        if not port.used:
+            gFileName.append(port.declare[0])
+            gLineNo.append(port.declare[1])
+            warning("Port '%s' was never used" % port.name)
+            gLineNo.pop()
+            gFileName.pop()
+    for node in gNodenames.values():
+        if not node.used:
+            gFileName.append(node.declare[0])
+            gLineNo.append(node.declare[1])
+            warning("Node '%s' was never used" % node.name)
+            gLineNo.pop()
+            gFileName.pop()
     for par in gParameters.values():
         gFileName.append(par.declare[0])
         gLineNo.append(par.declare[1])
@@ -3621,25 +3759,25 @@ def checkParmsAndVars():
         warning("No units specified for any parameters")
 
     for var in gVariables.values():
+        if var.funcNameAndArg[0] != "":
+            # was assigned as a function output variable
+            if var.used:
+                fname = var.funcNameAndArg[0]
+                argno = var.funcNameAndArg[1]
+                if fname in gUserFunctions:
+                    func = gUserFunctions[fname]
+                    if not func.outarg_used[argno]:
+                        func.outarg_used[argno] = True
+                        if gDebug:
+                            print("    Function '%s' output argument '%s' is used because variable '%s' is used"
+                                  % (fname,func.args[argno],var.name))
+                else: # pragma: no cover
+                    fatal("Programming error: function arguments")
+            else:
+                var.used = True # don't report as unused
         if var.name.startswith("FUNCTION::"):
             var.assign = 0 # suppress printing in summary
         else:
-            if var.funcNameAndArg[0] != "":
-                # was assigned as a function output variable
-                if var.used:
-                    fname = var.funcNameAndArg[0]
-                    argno = var.funcNameAndArg[1]
-                    if fname in gUserFunctions:
-                        func = gUserFunctions[fname]
-                        if not func.outarg_used[argno]:
-                            func.outarg_used[argno] = True
-                            if gDebug:
-                                print("    Function '%s' output argument '%s' is used because variable '%s' is used"
-                                      % (fname,func.args[argno],var.name))
-                    else: # pragma: no cover
-                        fatal("Programming error: function arguments")
-                else:
-                    var.used = True # don't report as unused
             if var.assign == -1:
                 gFileName.append(var.declare[0])
                 gLineNo.append(var.declare[1])
@@ -3677,6 +3815,9 @@ def checkParmsAndVars():
                                 % (func.name, func.args[i]) )
         elif gVerbose:
             notice("User-defined function '%s' is never used" % func.name)
+    for mac in gMacros.values():
+        if gVerbose and not mac.used:
+            notice("Macro '%s' is never used" % mac.name)
 # end of check checkParmsAndVars
 
 
@@ -4295,7 +4436,7 @@ def parseOther( line ):
 
     parser = Parser(line)
     val = parser.lex()
-    if val == ord(';') and gLastLineWasEvent:
+    if val == ord(';') and (gLastLineWasEvent or this_cond.type != "NOTHING"):
         # null statement
         val = parser.lex()
     keywd = ""
@@ -5042,6 +5183,7 @@ def parseOther( line ):
                     if nname1 != "":
                         if nname1 in gBranches:
                             dname = gBranches[nname1].discipline
+                            gBranches[nname1].used = True
                             if nname2 != "":
                                 if nname2 in gBranches:
                                     error("Invalid potential or flow access %s(branch,branch)" % acc)
@@ -5050,8 +5192,10 @@ def parseOther( line ):
                         else:
                             if nname1 in gPortnames:
                                 dname = gPortnames[nname1].discipline
+                                gPortnames[nname1].used = True
                             elif nname1 in gNodenames:
                                 dname = gNodenames[nname1].discipline
+                                gNodenames[nname1].used = True
                             else:
                                 error("Identifier '%s' is not a port, node, or branch in potential or flow access" % nname1)
                             if nname2 != "":
@@ -5061,8 +5205,10 @@ def parseOther( line ):
                                     error("Invalid potential or flow access %s(node,branch)" % acc)
                                 elif nname2 in gPortnames:
                                     dname2 = gPortnames[nname2].discipline
+                                    gPortnames[nname2].used = True
                                 elif nname2 in gNodenames:
                                     dname2 = gNodenames[nname2].discipline
+                                    gNodenames[nname2].used = True
                                 else:
                                     error("Identifier '%s' is not a port, node, or branch in potential or flow access" % nname2)
                                 if dname2 != "" and dname2 != dname:
@@ -5380,6 +5526,7 @@ def handleCompilerDirectives( line ):
         if stop < len(line):
             error("Extra characters after `ifdef")
         if token in gMacros:
+            gMacros[token].used = True
             gIfDefStatus.append(true_status)
         else:
             gIfDefStatus.append(false_status)
@@ -5513,7 +5660,9 @@ def preProcessNatures( lines ):
 def parseLines( lines ):
     global gScopeList, gLineNo
     global gStatementInCurrentBlock
+    prev_line = ""
     prev_attribs = []
+    in_attribute = ""
 
     j = 0
     while j < len(lines):
@@ -5535,23 +5684,28 @@ def parseLines( lines ):
             part = part.strip()
             if part == "":
                 continue
-            retarray = getAttributes(part)
+            retarray = getAttributes(part, in_attribute)
             part = retarray[0]
-            attribs = prev_attribs + retarray[1:]
+            in_attribute = retarray[1]
+            attribs = prev_attribs + retarray[2:]
             while part == "":
                 if i < len(parts):
                     part = parts[i]
                     i += 1
-                    retarray = getAttributes(part)
+                    retarray = getAttributes(part, in_attribute)
                     part = retarray[0]
-                    attribs += retarray[1:]
+                    in_attribute = retarray[1]
+                    attribs += retarray[2:]
                 else:
                     prev_attribs = attribs
                     break
-            if part == "":
+            if part == "" or in_attribute != "":
+                prev_line = prev_line + part
                 continue
             elif part[-1] == ';':
                 prev_attribs = []
+            part = prev_line + part
+            prev_line = ""
 
             # natures and disciplines
             #
@@ -5751,6 +5905,10 @@ def parseLines( lines ):
                                     part = tmpline
                                     j = tmpj
                                     gLineNo[-1] = j
+                retarray = getAttributes(part, in_attribute)
+                part = retarray[0]
+                in_attribute = retarray[1]
+                attribs += retarray[2:]
                 parseOther(part)
 # end of parseLines
 
@@ -6400,23 +6558,25 @@ class versionAction(argparse.Action):
 #
 
 parser = argparse.ArgumentParser(description='Parse and run basic checks on Verilog-A models')
-parser.add_argument('main_file',             help='name of top-level Verilog-A file')
-parser.add_argument('-a', '--all',           help='equivalent to --max_num 0', action='store_true')
-parser.add_argument('-b', '--binning',       help='analyze binning equations', action='store_true')
-parser.add_argument('-d', '--debug',         help='turn on debug mode', action='store_true')
-parser.add_argument('-f', '--fix_indent',    help='fix indentation problems', action='store_true')
-parser.add_argument('-i', '--info',          help='print detailed usage information', action=infoAction, nargs=0)
-parser.add_argument('-I', '--inc_dir',       help='add search path for include', action='append', default=[])
-parser.add_argument(      '--max_num',       help='maximum number of each type of error/warning message', type=int, default=5)
-parser.add_argument('-n', '--no_style',      help='turn off style checking', action='store_false')
-parser.add_argument('-s', '--indent_spaces', help='number of spaces to indent', type=int, default=4)
-parser.add_argument('-v', '--verbose',       help='turn on verbose mode', action='store_true')
-parser.add_argument(      '--version',       help='print version number', action=versionAction, nargs=0)
+parser.add_argument('main_file',              help='name of top-level Verilog-A file')
+parser.add_argument('-a', '--all',            help='equivalent to --max_num 0', action='store_true')
+parser.add_argument('-b', '--binning',        help='analyze binning equations', action='store_true')
+parser.add_argument('-d', '--debug',          help='turn on debug mode', action='store_true')
+parser.add_argument('-f', '--fix_indent',     help='fix indentation problems', action='store_true')
+parser.add_argument('-i', '--info',           help='print detailed usage information', action=infoAction, nargs=0)
+parser.add_argument('-I', '--inc_dir',        help='add search path for include', action='append', default=[])
+parser.add_argument(      '--max_num',        help='maximum number of each type of error/warning message', type=int, default=5)
+parser.add_argument('-n', '--no_style',       help='turn off style checking', action='store_false')
+parser.add_argument(      '--print_defaults', help='print default values for all parameters', action='store_true')
+parser.add_argument('-s', '--indent_spaces',  help='number of spaces to indent', type=int, default=4)
+parser.add_argument('-v', '--verbose',        help='turn on verbose mode', action='store_true')
+parser.add_argument(      '--version',        help='print version number', action=versionAction, nargs=0)
 args       = parser.parse_args()
 gIncDir    = args.inc_dir
 gDebug     = args.debug
 gBinning   = args.binning
 gFixIndent = args.fix_indent
+gPrDefVals = args.print_defaults
 if args.all:
     gMaxNum = 0
 else:
