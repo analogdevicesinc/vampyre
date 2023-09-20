@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """ VAMPyRE
     Verilog-A Model Pythonic Rule Enforcer
-    version 1.9.1, 2-August-2023
+    version 1.9.2, 1-Sept-2023
 
     intended for checking for issues like:
      1) hidden state (variables used before assigned)
@@ -22,8 +22,9 @@
        - proper use of the multiplicity attribute
        - proper implementation of mult_i, mult_q, mult_fn
     12) misuse of limexp
-    13) various problems with binning equations
-    14) nonlinear ddt() expressions
+    13) various problems with binning equations and units
+    14) nonlinear ddt() expressions and C(V)*ddt(V) formulations
+    15) superfluous assignments
 
     Copyright (c) 2023 Analog Devices, Inc.
 
@@ -50,7 +51,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.9.1"
+gVersionNumber = "1.9.2"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -91,6 +92,8 @@ gSpcPerInd        = 4
 gStyle            = False
 gVerbose          = False
 gBinning          = False
+gBinningPatterns  = [[], []]
+gBinningFactors   = {}
 gNoiseTypes       = []
 gSuperfluous      = False
 gCompactModel     = True
@@ -194,6 +197,8 @@ gUnitsDivide   = ["Ohm", "Ohms", "V/A", "K/W", "V^2/Hz"]
 # MULT_* factors
 gMultFactors = ["mult_i", "mult_q", "mult_fn", "MULT_I", "MULT_Q", "MULT_FN"]
 
+# for use in asString()
+gExprTypeNoExtraParen = ["==", "!=", "<", ">", "<=", ">=", "&&", "||", "!", "NOT", "NAME", "NUMBER", "FUNCCALL"]
 
 ################################################################################
 # classes
@@ -250,12 +255,12 @@ class Parameter:
             else:
                 rend = ")"
             ret = lend + self.min.asString() + ":" + self.max.asString() + rend
-        elif self.value_range == "cz":
-            ret = "[0:inf)"
-        elif self.value_range == "oz":
-            ret = "(0:inf)"
-        elif self.value_range == "sw":
-            ret = "[0:1]"
+        #elif self.value_range == "cz":
+        #    ret = "[0:inf)"
+        #elif self.value_range == "oz":
+        #    ret = "(0:inf)"
+        #elif self.value_range == "sw":
+        #    ret = "[0:1]"
         return ret
 
 
@@ -284,7 +289,7 @@ class Variable:
 
 class Access:
     """ Variable access info """
-    def __init__(self, type, file, line, subl, cond, zini=False):
+    def __init__(self, type, file, line, subl, cond, zini=0):
         self.type = type              # "SET" or "USE"
         self.file = file
         self.line = line
@@ -408,8 +413,8 @@ class Expression:
                             #deps.append("flow")
                             pass
                         else:
-                            error("Incorrect access function '%s' for %s '%s'" %
-                                  (self.e1, dname, nname1))
+                            error("Incorrect access function '%s' for %s '%s'"
+                                  % (self.e1, dname, nname1))
                     elif dname == "" and not branch_contrib:
                         # if branch_contrib, error was reported already
                         error("Cannot determine discipline of '%s'" % nname1)
@@ -446,10 +451,16 @@ class Expression:
             elif self.e1 in ["$port_connected", "$param_given"]:
                 if len(self.args) == 1:
                     nname = self.args[0].e1
-                    if self.e1 == "$port_connected" and nname not in gPortnames:
-                        error("Invalid argument '%s' to %s, must be a port" % (nname, self.e1))
-                    if self.e1 == "$param_given" and nname not in gParameters:
-                        error("Invalid argument '%s' to %s, must be a parameter" % (nname, self.e1))
+                    if self.e1 == "$port_connected":
+                        if nname in gPortnames:
+                            gPortnames[nname].used = True
+                        else:
+                            error("Invalid argument '%s' to %s, must be a port" % (nname, self.e1))
+                    elif self.e1 == "$param_given":
+                        if nname in gParameters:
+                            gParameters[nname].used += 1
+                        else:
+                            error("Invalid argument '%s' to %s, must be a parameter" % (nname, self.e1))
                 else:
                     error("Incorrect number of arguments to %s" % self.e1)
             elif self.e1 == "limexp":
@@ -521,7 +532,7 @@ class Expression:
                 pass
             else:
                 out_arg_pos = []
-                if assign_context and self.e1 == "ddt":
+                if (assign_context or branch_contrib) and self.e1 == "ddt":
                     deps = ["ddt"]
                 if self.e1 in gUserFunctions:
                     # find positions of output arguments
@@ -564,6 +575,24 @@ class Expression:
             dep1 = self.e1.getDependencies(assign_context, branch_contrib)
             dep2 = self.e2.getDependencies(assign_context, branch_contrib)
             deps = dep1 + dep2
+            if self.type == "*" and "ddt" in deps:
+                # check for C(V) * ddt(V)
+                ddt_biases = []
+                if self.e1.type == "FUNCCALL" and self.e1.e1 == "ddt":
+                    ddt_biases = checkDependencies(dep1, "", 0, False, False, False)[1]
+                    cdep = dep2
+                elif self.e2.type == "FUNCCALL" and self.e2.e1 == "ddt":
+                    ddt_biases = checkDependencies(dep2, "", 0, False, False, False)[1]
+                    cdep = dep1
+                if ddt_biases:
+                    biases = checkDependencies(cdep, "", 0, False, False, False)[1]
+                    bad_biases = []
+                    for bias in biases:
+                        if bias in ddt_biases:
+                            bad_biases.append(bias)
+                    if bad_biases:
+                        bias = simplifyBiases(bad_biases)
+                        error("Non-charge-conserving f(%s) * ddt(%s)" % (bias, bias))
         elif self.type in ["<<", ">>", "<<<", ">>>", "===", "!==",
                            "^~", "~^", "~&", "~|"]:
             # not expected in Verilog-A
@@ -676,9 +705,7 @@ class Expression:
             else:  # unary +/-
                 ret = self.type + "(" + self.e1.asString() + ")"
         elif self.type == "&&":
-            if self.e1.type in ["==", "!=", "<", ">", "<=", ">=", "&&", "||", "!", "NOT", "NAME", "NUMBER"] \
-                    and self.e2.type in ["==", "!=", "<", ">", "<=", ">=", "&&", "||", "!", "NOT", "NAME", "NUMBER"]:
-                # don't need extra ()
+            if self.e1.type in gExprTypeNoExtraParen and self.e2.type in gExprTypeNoExtraParen:
                 ret = self.e1.asString() + "&&" + self.e2.asString()
             else:
                 ret = "(" + self.e1.asString() + self.type + self.e2.asString() + ")"
@@ -734,6 +761,7 @@ class Parser:
         self.is_int = False
         self.escaped = False
         self.string = ""
+        self.parse_units = False
 
     def isNumber(self):
         return self.token == gTokenNumber
@@ -888,7 +916,11 @@ class Parser:
         escaped = False
         while ch != qstr or escaped:
             ch = self.getChar()
-            if ch == "":  # pragma: no cover
+            if ch == "":
+                error("Missing end-quote %s" % qstr)
+                if string[-1] == ';':
+                    self.ungetChar(';')
+                    string = string[0:-1]
                 break
             if escaped:
                 string += ch
@@ -933,7 +965,7 @@ class Parser:
             self.token = gTokenString
         else:
             ch = self.getChar()
-            if ord(ch) > 127:
+            if ord(ch) > 127 and not self.parse_units:
                 error("Encountered non-ASCII character '%s' (decimal %d)" % (ch, ord(ch)))
             self.token = ord(ch)
         return self.token
@@ -1057,7 +1089,8 @@ class Parser:
                     oper += self.getChar()
             if oper in ["++", "+=", "--", "-=", "*=", "/=", "<<", ">>", "<<<", ">>>",
                         "===", "!==", "^~", "~^", "~&", "~|"]:
-                error("Operator '%s' not valid in Verilog-A" % oper)
+                if not self.parse_units:
+                    error("Operator '%s' not valid in Verilog-A" % oper)
         self.eatSpace()
         return oper
 
@@ -1128,10 +1161,17 @@ class Parser:
         elif val == ord('('):
             expr = self.getExpression(is_cond)
             self.eatSpace()
+            if self.parse_units and self.peekChar().isalpha():
+                expr1 = expr
+                expr2 = self.getExpression()
+                expr = Expression("*")
+                expr.e1 = expr1
+                expr.e2 = expr2
+                self.eatSpace()
             if self.peekChar() == ')':
                 self.getChar()
                 self.eatSpace()
-            else:
+            elif not self.parse_units:
                 error("Missing ')'")
         elif val == ord('\''):
             if self.peekChar() == '{':
@@ -1142,7 +1182,7 @@ class Parser:
                 if self.peekChar() == '}':
                     self.getChar()
                     self.eatSpace()
-                else:
+                elif not self.parse_units:
                     error("Missing '}'")
             else:  # pragma: no cover
                 self.ungetChar(chr(val))
@@ -1154,7 +1194,7 @@ class Parser:
             if self.peekChar() == '}':
                 self.getChar()
                 self.eatSpace()
-            else:
+            elif not self.parse_units:
                 error("Missing '}'")
         elif val == ord('`'):
             # undefined macro
@@ -1392,7 +1432,7 @@ class Parser:
 
     def parsePower(self, is_cond):
         expr = self.parsePrefix(is_cond)
-        if self.peekOper() == "**":
+        if self.peekOper() == "**" or (self.parse_units and self.peekOper() == "^"):
             oper = self.getOper()
             lhs = expr
             rhs = self.parsePower(is_cond)
@@ -1513,7 +1553,7 @@ class Parser:
             expr.e2 = rhs
             expr.is_int = lhs.is_int and rhs.is_int
             if oper == "/":
-                if expr.is_int:
+                if expr.is_int and not self.parse_units:
                     warning("Integer divide")
                 self.checkExprZero(expr.e2)
         return expr
@@ -2545,6 +2585,18 @@ def getAttributes( line, in_attrib ):
             do_append = False
             error("Attribute found after ';', please add line break")
         stop = line.find("*)")
+        if stop > 0:
+            quot = line.find("\"")
+            if quot >= 0 and quot < stop:
+                stop = -1
+                in_quote = False
+                for i in range(len(line)-1):
+                    ch = line[i]
+                    if ch == '"':
+                        in_quote = not in_quote
+                    elif not in_quote and ch == '*' and line[i+1] == ')':
+                        stop = i
+                        break
         if stop >= 0:
             i = stop+2
             while i < len(line) and line[i].isspace():
@@ -2569,6 +2621,18 @@ def getAttributes( line, in_attrib ):
                         error("Extra comma before attributes")
                         attrib = attrib[1:]
                 nested = attrib.find("(*")
+                if nested > 0:
+                    quot = attrib.find("\"")
+                    if quot >= 0 and quot < nested:
+                        nested = -1
+                        in_quote = False
+                        for i in range(len(attrib)-1):
+                            ch = attrib[i]
+                            if ch == '"':
+                                in_quote = not in_quote
+                            elif not in_quote and ch == '(' and attrib[i+1] == '*': # pragma: no cover
+                                nested = i
+                                break
                 if nested >= 0:
                     countParentheses(attrib, 0, 1)
                     attrib = attrib[:nested]
@@ -2693,11 +2757,6 @@ def parseMacro( line ):
                         i += 1
                     else:
                         error("Missing ')' for macro definition")
-                j = i
-                while j < max_i and line[j].isspace():
-                    if line[j] == '\r' or line[j] == '\n':
-                        i = j+1
-                    j += 1
             if i < max_i:
                 value = line[i:]
             else:
@@ -3162,19 +3221,21 @@ def resetMacros():
 # clear all module-scope items for new module
 def initializeModule():
     global gParameters, gVariables, gHiddenState, gPortnames, gPortlist, gNodenames, gBranches, \
-           gMultScaled, gUsesDDT, gContribs, gBlocknames, gNoiseTypes
-    gParameters  = {}
-    gVariables   = {}
-    gHiddenState = {}
-    gPortnames   = {}
-    gPortlist    = ""
-    gNodenames   = {}
-    gBranches    = {}
-    gMultScaled  = {}
-    gUsesDDT     = False
-    gContribs    = {}
-    gBlocknames  = {}
-    gNoiseTypes  = []
+           gMultScaled, gUsesDDT, gContribs, gBlocknames, gBinningPatterns, gBinningFactors, gNoiseTypes
+    gParameters      = {}
+    gVariables       = {}
+    gHiddenState     = {}
+    gPortnames       = {}
+    gPortlist        = ""
+    gNodenames       = {}
+    gBranches        = {}
+    gMultScaled      = {}
+    gUsesDDT         = False
+    gContribs        = {}
+    gBlocknames      = {}
+    gBinningPatterns = [[], []]
+    gBinningFactors  = {}
+    gNoiseTypes      = []
     resetMacros()
 
     # $temperature, $vt, $mfactor, $abstime
@@ -3430,7 +3491,7 @@ def parseParamDecl( line, attribs ):
 
     inst = False
     model = True
-    units = ""
+    units = 0
     scale = ""
     if len(attribs) > 0:
         for i in range(0, len(attribs)-1, 2):
@@ -3558,7 +3619,7 @@ def parseParamDecl( line, attribs ):
         else:
             if parm.defv.type == "NAME" and parm.defv.e1 in gParameters:
                 dparm = gParameters[parm.defv.e1]
-                if dparm.units != units:
+                if dparm.units and units and dparm.units != units:
                     c1 = units.find("^")
                     p1 = units.find(pname)
                     c2 = dparm.units.find("^")
@@ -3571,15 +3632,15 @@ def parseParamDecl( line, attribs ):
                     elif c2 > 0 and p2 > c2 and pname.find(dparm.name) >= 0 and units.find(dparm.name) >= 0:
                         # PTWGLR with units m^PTWGLEXPR, PTWGL with units m^PTWGLEXP
                         units = dparm.units
-                if dparm.units != units:
-                    if units == "":
-                        u1 = "no units"
-                    else:
+                if (dparm.units or units) and dparm.units != units:
+                    if units:
                         u1 = "units '" + units + "'"
-                    if dparm.units == "":
-                        u2 = "no units"
                     else:
+                        u1 = "no units"
+                    if dparm.units:
                         u2 = "units '" + dparm.units + "'"
+                    else:
+                        u2 = "no units"
                     notice("Parameter '%s' with %s has default '%s' with %s" % (pname, u1, dparm.name, u2))
             deps = parm.defv.getDependencies(False, False)
             for dep in deps:
@@ -4172,37 +4233,37 @@ def checkMultFactors( rhs ):
             elif "MULT_FN" in factors:
                 countMultFactors("MULT_FN", factors)
             else:
-                if "mult_i" in factors:
-                    error("Flicker noise contribution uses mult_i instead of mult_fn")
-                elif "MULT_I" in factors:
+                if "MULT_I" in factors:
                     error("Flicker noise contribution uses MULT_I instead of MULT_FN")
-                elif "mult_fn" in gParameters:
-                    error("Flicker noise contribution missing mult_fn")
-                else:
+                elif "mult_i" in factors:
+                    error("Flicker noise contribution uses mult_i instead of mult_fn")
+                elif "MULT_FN" in gParameters:
                     error("Flicker noise contribution missing MULT_FN")
+                else:
+                    error("Flicker noise contribution missing mult_fn")
         elif "ddt" in factors:
             if "mult_q" in factors:
                 countMultFactors("mult_q", factors)
             elif "MULT_Q" in factors:
                 countMultFactors("MULT_Q", factors)
             else:
-                if "mult_i" in factors:
-                    error("Charge contribution uses mult_i instead of mult_q")
-                elif "MULT_I" in factors:
+                if "MULT_I" in factors:
                     error("Charge contribution uses MULT_I instead of MULT_Q")
-                elif "mult_q" in gParameters:
-                    error("Charge contribution missing mult_q")
-                else:
+                elif "mult_i" in factors:
+                    error("Charge contribution uses mult_i instead of mult_q")
+                elif "MULT_Q" in gParameters:
                     error("Charge contribution missing MULT_Q")
+                else:
+                    error("Charge contribution missing mult_q")
         else:
             if "mult_i" in factors:
                 countMultFactors("mult_i", factors)
             elif "MULT_I" in factors:
                 countMultFactors("MULT_I", factors)
-            elif "mult_i" in gParameters:
-                error("Current contribution missing mult_i")
-            else:
+            elif "MULT_I" in gParameters:
                 error("Current contribution missing MULT_I")
+            else:
+                error("Current contribution missing mult_i")
 
 
 def checkPorts():
@@ -4422,25 +4483,23 @@ def checkParmsAndVars():
                     # oppt variable used at end
                     acc = Access("USE", var.declare[0], 999999, 0, [])
                     var.accesses.append(acc)
-                first_unused_set = 0
                 for i in range(len(var.accesses)):
                     acc_i = var.accesses[i]
                     if acc_i.type == "USE":
                         have_unused = False
-                        #for j in range(i-1,first_unused_set-1,-1):
                         for j in range(i):
                             acc_j = var.accesses[j]
-                            for cond in acc_j.cond:
-                                if not acc_j.used and  acc_j.type == "SET":
-                                    have_unused = True
+                            if not acc_j.used and acc_j.type == "SET":
+                                have_unused = True
+                                break
                         if have_unused:
                             set_conditions = []
-                            for j in range(i-1,first_unused_set-1,-1):
+                            for j in range(i-1,-1,-1):
                                 acc_j = var.accesses[j]
                                 done = False
-                                for cond in acc_j.cond:
-                                    if acc_j.type == "SET":
-                                        if cond == acc_i.cond:
+                                if acc_j.type == "SET":
+                                    for cond in acc_j.cond:
+                                        if cond in acc_i.cond:
                                             # used under same conditions as set
                                             acc_j.used = True
                                             done = True
@@ -4453,21 +4512,36 @@ def checkParmsAndVars():
                                         acc_j.used = True
                                         if set_conditions:
                                             set_conditions = mergeConditions(set_conditions, cond)
+                                            if set_conditions == [] and (len(cond) < 3 or cond[0:3] != "NOT"):
+                                                done = True
+                                                break
                                         else:
                                             set_conditions = acc_j.cond
                                 if done:
                                     break
                             if acc_i.loop:
+                                set_in_loop = False
                                 for j in range(i):
                                     acc_j = var.accesses[j]
-                                    if acc_j.loop and acc_j.type == "SET":
+                                    if acc_j.loop == acc_i.loop and acc_j.type == "SET":
                                         acc_j.used = True
+                                        set_in_loop = True
+                                if not set_in_loop:
+                                    # look for last assignment in the loop
+                                    for j in range(len(var.accesses)-1,i,-1):
+                                        acc_j = var.accesses[j]
+                                        if acc_j.loop == acc_i.loop and acc_j.type == "SET" and \
+                                                (acc_j.file != acc_i.file or \
+                                                 acc_j.line != acc_i.line or acc_j.subl != acc_i.subl):
+                                            acc_j.used = True
+                                            break
                 zini = False
+                init = True
                 for acc in var.accesses:
                     if acc.type == "SET":
-                        if acc.zini:
+                        if acc.zini == 1:
                             if zini:
-                                if gVerbose:
+                                if gVerbose or isinstance(zini, str):
                                     gFileName.append(acc.file)
                                     gLineNo.append(acc.line)
                                     notice("Repeated initialization of %s=0" % var.name, "RepeatedInit")
@@ -4483,21 +4557,33 @@ def checkParmsAndVars():
                                         notice("Repeated initialization of %s=0" % var.name)
                                 gFileName.pop()
                                 gLineNo.pop()
+                                zini = "DONE"
                             else:
                                 zini = acc
+                        if not acc.used:
+                            gFileName.append(acc.file)
+                            gLineNo.append(acc.line)
+                            if acc.zini != 1:
+                                if acc.zini == 2 and init:
+                                    what = "initialization of"
+                                else:
+                                    what = "assignment to"
+                                    init = False
+                                if gVerbose and acc.subl > 0:
+                                    notice("Superfluous %s %s (macro line %d)" % (what, var.name, acc.subl))
+                                else:
+                                    notice("Superfluous %s %s" % (what, var.name))
+                            elif gVerbose:
+                                if acc.subl > 0:
+                                    notice("Unnecessary initialization of %s=0 (macro line %d)" % (var.name, acc.subl))
+                                else:
+                                    notice("Unnecessary initialization of %s=0" % var.name)
+                            gFileName.pop()
+                            gLineNo.pop()
+                        else:
+                            init = False
                     else:
                         zini = False
-                    if acc.type == "SET" and not acc.used:
-                        gFileName.append(acc.file)
-                        gLineNo.append(acc.line)
-                        if not acc.zini:
-                            #notice("Superfluous assignment to %s" % var.name, "SuperfluousAssign")
-                            notice("Superfluous assignment to %s" % var.name)
-                        elif gVerbose:
-                            #notice("Unnecessary initialization of %s=0" % var.name, "UnnecessaryInit")
-                            notice("Unnecessary initialization of %s=0" % var.name)
-                        gFileName.pop()
-                        gLineNo.pop()
             if var.oppt and var.name.lower() in param_names_lower:
                 parname = ""
                 for par in gParameters.values():
@@ -4510,20 +4596,20 @@ def checkParmsAndVars():
                     if not mult_i or not mult_i.name in var.factors:
                         if mult_i:
                             mname = mult_i.name
-                        elif len(not_lower) == 0:
-                            mname = "mult_i"
-                        else:
+                        elif len(not_upper) == 0: # pragma: no cover
                             mname = "MULT_I"
+                        else:
+                            mname = "mult_i"
                         warning("Operating-point variable '%s' with units '%s' not scaled by %s"
                                 % (var.name, var.units, mname))
                 elif var.units in ["C", "F"]:
                     if not mult_q or not mult_q.name in var.factors:
                         if mult_q:
                             mname = mult_q.name
-                        elif len(not_lower) == 0:
-                            mname = "mult_q"
-                        else:
+                        elif len(not_upper) == 0:
                             mname = "MULT_Q"
+                        else:
+                            mname = "mult_q"
                         warning("Operating-point variable '%s' with units '%s' not scaled by %s"
                                 % (var.name, var.units, mname))
 
@@ -4607,8 +4693,8 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt
                 else:
                     access = Access("USE", gFileName[-1], gLineNo[-1], gSubline, [conds])
                     for lt in gLoopTypes:
-                        if lt in ["for", "repeat", "while"]:
-                            access.loop = True
+                        if lt[0] in ["for", "repeat", "while"]:
+                            access.loop = lt
                             break
                     gVariables[vn].accesses.append(access)
             if bias_dep < gVariables[vn].bias_dep:
@@ -4685,14 +4771,30 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt
 # end of checkDependencies
 
 
-def registerLoopVariableUse( loop_cond ):
+def registerLoopVariableUse( loop_cond, loop_info ):
     deps = loop_cond.getDependencies(False, False)
     conds = getCurrentConditions(Expression("NOTHING"), 0)[0]
+    done = []
     for dep in deps:
         vn = findVariableInScope(dep)
         if vn in gVariables:
             access = Access("USE", gFileName[-1], gLineNo[-1], gSubline, [conds])
             gVariables[vn].accesses.append(access)
+            done.append(vn)
+    if loop_info:
+        for (vn, var) in gVariables.items():
+            if vn not in done:
+                for i in range(len(var.accesses)):
+                    acc = var.accesses[i]
+                    if acc.loop:
+                        if acc.type == "USE":
+                            if acc.file == loop_info[1] and acc.line > loop_info[2] \
+                                and (i+1 == len(var.accesses) or var.accesses[i+1].type != "SET" \
+                                     or acc.line != var.accesses[i+1].line):
+                                access = Access("USE", gFileName[-1], gLineNo[-1], gSubline, [conds])
+                                var.accesses.append(access)
+                        elif acc.type == "SET" and acc.file == loop_info[1] and acc.line > loop_info[2]:
+                            break
 
 
 # split on "&&", but watch out for parentheses
@@ -4883,6 +4985,29 @@ def checkCondForBiasDepEquality( cond ):
     return ret
 
 
+def simplifyBiases(bias_list):
+    ret = bias_list
+    if len(bias_list) == 3:
+        pfx0 = bias_list[0].find("(")
+        if pfx0 > 0:
+            bname = bias_list[0][pfx0+1:-1]
+            if bname in gBranches:
+                branch = gBranches[bname]
+                pfx1 = bias_list[1].find("(")
+                pfx2 = bias_list[2].find("(")
+                if pfx1 == pfx2 and bias_list[1][0:pfx1] == bias_list[2][0:pfx2]:
+                    nname1 = bias_list[1][pfx1+1:-1]
+                    nname2 = bias_list[2][pfx2+1:-1]
+                    if nname1 == branch.node1 and nname2 == branch.node2:
+                        ret = bias_list[0]
+    elif len(bias_list) == 2:
+        pfx0 = bias_list[0].find("(")
+        pfx1 = bias_list[1].find("(")
+        if pfx0 == pfx1 and bias_list[0][0:pfx0] == bias_list[1][0:pfx1]:
+            ret = bias_list[0][0:-1] + "," + bias_list[1][pfx1+1:]
+    return ret
+
+
 def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, bias_in, ddt_in, for_var, set_by_func, fname, argnum ):
     found = False
     vn = findVariableInScope(varname)
@@ -4909,7 +5034,7 @@ def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, bias_in, ddt_in
             var.bias_dep = bias_dep
             var.biases = biases
         elif len(var.conditions) > 0:
-            if conds == "":
+            if conds in ["", "NOT(0)"]:
                 # no conditions for this assignment
                 var.conditions = []
                 var.bias_dep = bias_dep
@@ -4917,13 +5042,16 @@ def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, bias_in, ddt_in
             else:
                 oldconds = var.conditions
                 var.conditions = mergeConditions(oldconds, conds)
-        zero_init = False
-        if rhs and rhs.type == "NUMBER" and rhs.number == 0 and not conds:
-            zero_init = True
+        zero_init = 0
+        if rhs and rhs.type == "NUMBER" and rhs.number == 0:
+            if conds:
+                zero_init = 2
+            else:
+                zero_init = 1
         access = Access("SET", gFileName[-1], gLineNo[-1], gSubline, [conds], zero_init)
         for lt in gLoopTypes:
-            if lt in ["for", "repeat", "while"]:
-                access.loop = True
+            if lt[0] in ["for", "repeat", "while"]:
+                access.loop = lt
                 break
         var.accesses.append(access)
         if conds == "" or var.bias_dep < bias_dep:
@@ -4995,8 +5123,209 @@ def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, bias_in, ddt_in
 # end of markVariableAsSet
 
 
+# recursive parsing of units expression
+def getUnitFactors( expr ):
+    num = []
+    den = []
+    mct = 0
+    if expr.type == "NAME":
+        num = [expr.e1]
+        if expr.e1 == "m":
+            mct += 1
+    elif expr.type == "NUMBER":
+        if gDebug and expr.number != 1.0:
+            notice("Unexpected number %g in units expression" % expr.number)
+    elif expr.type in ["*", "-"]:
+        # "-" shows up in "ohm-um^WR"
+        fac1 = getUnitFactors(expr.e1)
+        fac2 = getUnitFactors(expr.e2)
+        num = fac1[0] + fac2[0]
+        den = fac1[1] + fac2[1]
+        mct += fac1[2] + fac2[2]
+    elif expr.type == "/":
+        fac1 = getUnitFactors(expr.e1)
+        fac2 = getUnitFactors(expr.e2)
+        num = fac1[0] + fac2[1]
+        den = fac1[1] + fac2[0]
+        mct += fac1[2] - fac2[2]
+    elif expr.type == "^":
+        fac = getUnitFactors(expr.e1)
+        if expr.e2.is_int:
+            cnt = int(expr.e2.number)
+            if cnt > 0:
+                num = cnt * fac[0]
+                den = cnt * fac[1]
+            elif cnt < 0:
+                num = (-cnt) * fac[1]
+                den = (-cnt) * fac[0]
+            mct += cnt * fac[2]
+        else:
+            # V^0.5 or m^(LLN+1)
+            num = [expr.asString()]
+            if expr.e2.type == "NUMBER":
+                mct += expr.e2.number * fac[2]
+    elif expr.type == "FUNCCALL" and len(expr.args) == 1:
+        # ohm(um)^WR
+        fname = expr.e1
+        num.append(fname)
+        if fname == "m":
+            mct += 1
+        fac = getUnitFactors(expr.args[0])
+        num += fac[0]
+        den += fac[1]
+        mct += fac[2]
+    return [num, den, mct]
+
+
+# parse units string
+def parseUnitsString( units ):
+    num = []
+    den = []
+    mct = 0
+    if units and units != "-" and units[0] != "?":
+        if units[0] == '/':
+            units = "1" + units
+        parser = Parser(units)
+        parser.parse_units = True
+        expr = parser.getExpression()
+        [num, den, mct] = getUnitFactors(expr)
+    return [num, den, mct]
+
+
+def compareUnits( num1, den1, cnt1, num2, den2, cnt2, add ):
+    [numa, dena, cnta] = parseUnitsString(add)
+    for fac in numa:
+        if fac in num2:
+            idx = num2.index(fac)
+            num2[idx] = ""
+        elif fac in den1:
+            idx = den1.index(fac)
+            den1[idx] = ""
+        else:
+            num1.append(fac)
+    for fac in dena:
+        if fac in den2:
+            idx = den2.index(fac)
+            den2[idx] = ""
+        elif fac in num1:
+            idx = num1.index(fac)
+            num1[idx] = ""
+        else:
+            den1.append(fac)
+    for i in range(len(num1)):
+        fac = num1[i]
+        if fac in num2:
+            idx = num2.index(fac)
+            num2[idx] = ""
+            num1[i] = ""
+    for i in range(len(den1)):
+        fac = den1[i]
+        if fac in den2:
+            idx = den2.index(fac)
+            den2[idx] = ""
+            den1[i] = ""
+    bad_num = []
+    for fac in (num1+den2):
+        if fac:
+            bad_num.append(fac)
+    bad_den = []
+    for fac in (den1+num2):
+        if fac:
+            bad_den.append(fac)
+    if bad_num or bad_den:
+        if cnt1 + cnta == cnt2:
+            # powers of 'm' match; see if there are any other units
+            for fac in (bad_num+bad_den):
+                if fac != "m" and \
+                        (len(fac) < 2 or fac[0:2] != "m^") and \
+                        (len(fac) < 3 or fac[0:3] != "(m^"):
+                    return False
+        else:
+            return False
+    return True
+
+
+# check units of binning parameter against main parameter
+def checkBinUnits( spar, prefix, name, units ):
+    if isinstance(units, str) or isinstance(spar.units, str):
+        [nump, denp, cntp] = parseUnitsString(units)
+        [nums, dens, cnts] = parseUnitsString(spar.units)
+        bad_units = False
+        expect = "?"
+        prefix = prefix.upper()
+        if gBinningFactors and prefix in gBinningFactors:
+            expect = gBinningFactors[prefix]
+
+            if units in ("", "-"):
+                if spar.units != expect:
+                    bad_units = expect
+            elif expect == "":
+                if units != spar.units:
+                    bad_units = units
+            elif not compareUnits(nump, denp, cntp, nums, dens, cnts, expect):
+                if units[0] == '/':
+                    bad_units = expect + units
+                else:
+                    bad_units = units + "*" + expect
+
+            if bad_units:
+                if units:
+                    if bad_units == units:
+                        should = "(should be '%s' to match units for '%s')" % (bad_units, name)
+                    else:
+                        should = "(should be '%s' since units for '%s' are '%s')" % (bad_units, name, units)
+                else:
+                    should = "(should be '%s' since '%s' has no units)" % (bad_units, name)
+                gFileName.append(spar.declare[0])
+                gLineNo.append(spar.declare[1])
+                if spar.units and spar.units != "-":
+                    notice("Unexpected units '%s' for binning parameter '%s' %s"
+                           % (spar.units, spar.name, should), "Unexpected units")
+                else:
+                    notice("Missing units for binning parameter '%s' %s"
+                           % (spar.name, should), "Unexpected units")
+                gFileName.pop()
+                gLineNo.pop()
+        else:
+            if spar.units == units:
+                expect = ""
+            elif spar.units in (units+"*m", "m*"+units):
+                expect = "m"
+            elif spar.units == "m^2" and units == "m":
+                expect = "m"
+            elif spar.units in (units+"*m^2", "m^2*"+units, "(m^2)*"+units):
+                expect = "m^2"
+            elif spar.units == units + "/m":
+                expect = "1/m"
+            elif spar.units == units + "/m^2":
+                expect = "1/m^2"
+            elif len(units) > 2 and units[0:2] == "1/":
+                if spar.units == "m" + units[1:]:
+                    expect = "m"
+                elif spar.units == "m^2" + units[1:]:
+                    expect = "m^2"
+            else:
+                if cnts - cntp == 1:
+                    expect = "m"
+                elif cnts - cntp == 2:
+                    expect = "m^2"
+
+            if expect != "?":
+                gBinningFactors[prefix] = expect
+                if gDebug:
+                    notice("Binning factor for %s-parameters set to '%s'" % (prefix, expect))
+            elif units and (not spar.units or spar.units == "-"):
+                gFileName.append(spar.declare[0])
+                gLineNo.append(spar.declare[1])
+                should = "(note that '%s' has units %s)" % (name, units)
+                notice("Missing units for binning parameter '%s' %s" % (spar.name, should), "Unexpected units")
+                gFileName.pop()
+                gLineNo.pop()
+# end of checkBinUnits
+
+
 # try to parse term as something like L{pname} * Inv_L
-def checkBinningTerm( t_in, pname ):
+def checkBinningTerm( t_in, pname, punit ):
     term = deepcopy(t_in)  # term may be modified below
     fact = ""
     pfx  = ""
@@ -5113,10 +5442,12 @@ def checkBinningTerm( t_in, pname ):
             if len(sname) > len(pname) and pname == sname[len(sname)-len(pname):]:
                 # LPAR, WPAR, PPAR, P2PAR, etc.
                 pfx = sname[0:len(sname)-len(pname)]
+                checkBinUnits(spar, pfx, pname, punit)
             elif (pname[-1].lower() == 'o' or pname[-1] == '0') and \
                     pname[:-1] == sname[0:len(pname)-1]:
                 # PARO and PARL, PARWL, etc.
                 sfx = sname[len(pname)-1:]
+                checkBinUnits(spar, sfx, pname, punit)
             elif pname[0:2].lower() == 'po' and pname[2:] == sname[len(sname)-len(pname)+2:]:
                 # POPAR and LPAR, WPAR, etc.
                 pfx = sname[0:2]
@@ -5124,15 +5455,13 @@ def checkBinningTerm( t_in, pname ):
 # end of checkBinningTerm
 
 
-# keep track of binning equation patterns
-gBinningPatterns = [[], []]
-
 
 def checkBinning( vname, t_0, t_1, t_2, t_3, t_4, t_5, line ):
     if t_0.type == "NAME" and t_0.e1 in gParameters:
         pname = t_0.e1
         pname_l = pname.lower()
         plen = len(pname)
+        punit = gParameters[pname].units
         vname_l = vname.lower()
         vlen = len(vname)
         vpfx = ""
@@ -5161,15 +5490,15 @@ def checkBinning( vname, t_0, t_1, t_2, t_3, t_4, t_5, line ):
             pfx0 = pname[0:2]
             if vsfx == "":
                 vsfx = "NONE"
-        [fact1, op1, pfx1, sfx1] = checkBinningTerm(t_1, pname)
-        [fact2, op2, pfx2, sfx2] = checkBinningTerm(t_2, pname)
-        [fact3, op3, pfx3, sfx3] = checkBinningTerm(t_3, pname)
+        [fact1, op1, pfx1, sfx1] = checkBinningTerm(t_1, pname, punit)
+        [fact2, op2, pfx2, sfx2] = checkBinningTerm(t_2, pname, punit)
+        [fact3, op3, pfx3, sfx3] = checkBinningTerm(t_3, pname, punit)
         if t_4:
-            [fact4, op4, pfx4, sfx4] = checkBinningTerm(t_4, pname)
+            [fact4, op4, pfx4, sfx4] = checkBinningTerm(t_4, pname, punit)
         else:
             [fact4, op4, pfx4, sfx4] = ["", "", "", ""]
         if t_5:
-            [fact5, op5, pfx5, sfx5] = checkBinningTerm(t_5, pname)
+            [fact5, op5, pfx5, sfx5] = checkBinningTerm(t_5, pname, punit)
         else:
             [fact5, op5, pfx5, sfx5] = ["", "", "", ""]
         warned = False
@@ -5309,7 +5638,9 @@ def parseOther( line ):
                 this_cond.e2.number = case_val
             else:
                 # default: (assume no hidden state if "default" is present)
-                this_cond = Expression("NOTHING")
+                this_cond = Expression("NOT")
+                this_cond.e1 = Expression("NUMBER")
+                this_cond.e1.number = 0
             val = parser.lex()
             while val == ord(','):
                 val = parser.lex()
@@ -5365,8 +5696,8 @@ def parseOther( line ):
             else:
                 analog_block = "None"
             val = parser.lex()
-            if last_loop in ["for", "repeat", "while"] and last_cond.type != "NOTHING":
-                registerLoopVariableUse(last_cond)
+            if last_loop[0] in ["for", "repeat", "while"] and last_cond.type != "NOTHING":
+                registerLoopVariableUse(last_cond, last_loop)
             if parser.isIdentifier():
                 keywd = parser.getString()
             elif val == 0:
@@ -5681,7 +6012,7 @@ def parseOther( line ):
             elif val != 0:
                 error("Unexpected token %d after 'begin'" % val)
             gScopeList.append(bname)
-            gLoopTypes.append(this_loop)
+            gLoopTypes.append([this_loop, gFileName[-1], gLineNo[-1]])
             gConditions.append(this_cond)
             gCondBiasDep.append(this_c_bd)
             this_loop = ""
@@ -6130,7 +6461,7 @@ def parseOther( line ):
                         deps = indirect.getDependencies(False, False)
                         [bias_dep, biases, ddt] = checkDependencies(deps, "Indirect branch contribution depends on",
                                                                     this_c_bd, False, False, True)
-                        if ddt:
+                        if ddt: # pragma: no cover
                             ddt = indirect.ddtCheck()
                             if ddt > 1:
                                 error("Indirect branch contribution is nonlinear in ddt()")
@@ -6227,6 +6558,8 @@ def parseOther( line ):
                             posstr = "Second"
                         if len(args) == 0:
                             error("Expected at least 1 argument for %s" % keywd)
+                        elif len(args) <= strpos:
+                            error("Expected at least %d arguments for %s" % (strpos+1,keywd))
                         elif args[strpos].type != "STRING":
                             error("%s argument to %s must be a string" % (posstr, keywd))
                     if val == ord(';'):
@@ -6329,7 +6662,7 @@ def parseOther( line ):
 
     gLoopTypeForLastStmt.append(this_loop)
     if this_loop in ["for", "repeat", "while"] and this_cond.type != "NOTHING":
-        registerLoopVariableUse(this_cond)
+        registerLoopVariableUse(this_cond, False)
     gConditionForLastStmt.append(this_cond)
     gCondBiasDForLastStmt.append(this_c_bd)
 
@@ -6459,6 +6792,9 @@ def handleCompilerDirectives( line ):
             error("Found `else without `ifdef")
         did_compiler_directive = True
     elif line.startswith("`endif"):
+        start = 6
+        if len(line) > start and not line[start].isspace():
+            error("Missing space after %s" % line[0:start])
         if len(gIfDefStatus) > 0:
             gIfDefStatus.pop()
         else:
@@ -6594,6 +6930,7 @@ def parseLines( lines ):
         j += 1
 
         line = handleCompilerDirectives(line)
+        num_sublines = len(line.split("\n"))
         line = line.strip()
         if line == "":
             continue
@@ -6604,7 +6941,8 @@ def parseLines( lines ):
         while i < len(parts):
             part = parts[i]
             i += 1
-            gSubline += 1
+            if num_sublines > 1:
+                gSubline += 1
             part = part.strip()
             if part == "":
                 continue
@@ -6967,6 +7305,7 @@ def parseFile( filename ):
             fatal("Failed to open file: %s" % filename)
     gFileName.append(filename)
     gLineNo.append(0)
+    initial_ifdef = len(gIfDefStatus)
 
     # variables to track indentation style
     fixed_lines = []
@@ -7504,6 +7843,11 @@ def parseFile( filename ):
     preProcessNaturesAndContribs(lines_to_parse)
     gLineNo[-1] = 0
     parseLines(lines_to_parse)
+
+    if len(gIfDefStatus) > initial_ifdef:
+        error("Missing `endif")
+        while len(gIfDefStatus) > initial_ifdef:
+            gIfDefStatus.pop()
 
     # done with this file
     gFileName.pop()
