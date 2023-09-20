@@ -1,0 +1,1 @@
+VAMPyRE was developed by Analog Devices, Inc. and has been contributed to Silicon Integration Initiative, Inc.'s Compact Model Coalition.
