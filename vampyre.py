@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """ VAMPyRE
     Verilog-A Model Pythonic Rule Enforcer
-    version 1.9.0, 3-Mar-2023
+    version 1.9.1, 2-August-2023
 
     intended for checking for issues like:
      1) hidden state (variables used before assigned)
@@ -50,7 +50,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.9.0"
+gVersionNumber = "1.9.1"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -60,12 +60,16 @@ gHiddenState   = {}
 gUserFunctions = {}
 gAccessFuncs   = {}
 gPortnames     = {}  # terminals
+gPortlist      = ""
 gNodenames     = {}  # internal nodes
 gBranches      = {}
+gMultScaled    = {}
+gContribs      = {}  # contributions
 gBlocknames    = {}
 gMacros        = {}
 gIfDefStatus   = []
 gScopeList     = []
+gLoopTypes     = []
 gConditions    = []  # if-conditions in play
 gCondBiasDep   = []  # whether conditions are bias-dependent:
                      # 0 (no), 1 (from if cond), 2 (yes), 3 (deriv error), 4 (ddx)
@@ -74,21 +78,25 @@ gMissingConstantsFile = ""
 gStatementInCurrentBlock = False
 gLastDisplayTask  = []
 gLastLineWasEvent = False
-gCurrentFunc   = 0
-gFileName      = []
-gLineNo        = []
-gIncDir        = []
-gDebug         = False
-gDefines       = []
-gFixIndent     = False
-gMaxNum        = 5
-gSpcPerInd     = 4
-gStyle         = False
-gVerbose       = False
-gBinning       = False
-gNoiseTypes    = []
-gCompactModel  = True
-gPrDefVals     = False
+gCurrentFunc      = 0
+gFileName         = []
+gLineNo           = []
+gSubline          = 0
+gIncDir           = []
+gDebug            = False
+gDefines          = []
+gFixIndent        = False
+gMaxNum           = 5
+gSpcPerInd        = 4
+gStyle            = False
+gVerbose          = False
+gBinning          = False
+gNoiseTypes       = []
+gSuperfluous      = False
+gCompactModel     = True
+gCheckMultFactors = 0
+gUsesDDT          = False
+gPrDefVals        = False
 
 # dictionaries to track how many of each type of message
 gErrorMsgDict   = {}
@@ -225,7 +233,7 @@ class Parameter:
         self.inst = False        # instance parameter (or both)
         self.model = False       # model parameter (or both)
         self.scale = ""          # linear or quadratic
-        self.used = False        # whether used
+        self.used = 0            # number of times used
         self.is_alias = False    # True for aliasparam (should not be used)
 
     def getValueRangeStr(self):
@@ -262,7 +270,9 @@ class Variable:
         self.declare = [file, line]
         self.assign = -1              # line where value assigned
         self.prev_assign = []         # details about previous assignment
+        self.non_zero_assign = False  # true if assigned a non-zero value
         self.conditions = []          # conditions when assigned
+        self.accesses = []            # details about assignments and uses
         self.used = False             # whether used
         self.bias_dep = 0             # bias-dependent: 0=no, 1=from if cond, 2=yes, 3=deriv error, 4=ddx
         self.biases = []              # node voltages (for ddx check)
@@ -272,17 +282,31 @@ class Variable:
         self.func_name_arg = ["", 0]  # tracing whether function output arg is used
 
 
+class Access:
+    """ Variable access info """
+    def __init__(self, type, file, line, subl, cond, zini=False):
+        self.type = type              # "SET" or "USE"
+        self.file = file
+        self.line = line
+        self.subl = subl
+        self.cond = cond              # conditions in effect
+        self.loop = False             # if used in loop
+        self.zini = zini              # initialization to zero
+        self.used = False
+
+
 class Port:
     """ Verilog-AMS port """
     def __init__(self, name, file, line):
         self.name = name
         self.type = ""
-        self.direction = ""      # inout, input, output
-        self.discipline = ""     # electrical, thermal, ...
+        self.direction = ""   # inout, input, output
+        self.discipline = ""  # electrical, thermal, ...
         self.declare = [file, line]
         self.is_bus = False
         self.msb = 0
         self.lsb = 0
+        self.mult = False     # whether contributions to this node need mult scaling
         self.used = False
 
 
@@ -295,7 +319,19 @@ class Branch:
         self.discipline = ""  # electrical, thermal, ...
         self.lhs_flow = 0     # flow contrib: 0=no, 1=yes, 2=bias-dep condition
         self.lhs_pot  = 0     # potential contrib: 0=no, 1=yes, 2=bias-dep condition
+        self.mult = False     # whether contributions to this branch need mult scaling
         self.used = False
+
+
+class Contribution:
+    """ Verilog-AMS contribution """
+    def __init__(self, acc):
+        self.acc = acc
+        self.func = ""
+        self.node1 = ""
+        self.node2 = ""
+        self.branch = ""
+        self.discipline = ""
 
 
 class Macro:
@@ -1027,20 +1063,45 @@ class Parser:
 
     # expression parsing - watch for order of operations
 
-    def parseArgList(self, is_cond=False):
+    def parseArgList(self, is_cond=False, allow_repl=False):
         args = []
         expr = self.getExpression(is_cond)
         if expr.type == "NOTHING" and self.peekChar() == ')':
             return []
-        args.append(expr)
         self.eatSpace()
         ch = self.peekChar()
-        while ch == ',':
+        if ch == '{' and allow_repl:
             self.getChar()
-            expr = self.getExpression()
-            args.append(expr)
+            sub_args = self.parseArgList()
             self.eatSpace()
-            ch = self.peekChar()
+            if self.peekChar() == '}':
+                self.getChar()
+                self.eatSpace()
+            else:
+                error("Missing '}'")
+            if not expr.is_int:
+                error("Non-integer multiplier '%s' in replication" % expr.asString())
+            repl = 1
+            if expr.type == "NUMBER":
+                repl = int(expr.number)
+            elif expr.type == "NAME" and expr.e1 in gParameters:
+                gParameters[expr.e1].used += 1
+                defv = gParameters[expr.e1].defv
+                if defv.type == "NUMBER":
+                    repl = int(defv.number)
+                else:
+                    warning("Cannot determine value of multiplier '%s' in replication" % expr.e1)
+            else:
+                error("Invalid multiplier '%s' in replication" % expr.asString())
+            args = repl * sub_args
+        else:
+            args.append(expr)
+            while ch == ',':
+                self.getChar()
+                expr = self.getExpression()
+                args.append(expr)
+                self.eatSpace()
+                ch = self.peekChar()
         return args
 
     def parsePrimary(self, is_cond):
@@ -1076,7 +1137,7 @@ class Parser:
             if self.peekChar() == '{':
                 self.getChar()
                 expr = Expression("ARRAY")
-                expr.args = self.parseArgList(is_cond)
+                expr.args = self.parseArgList(is_cond, True)
                 self.eatSpace()
                 if self.peekChar() == '}':
                     self.getChar()
@@ -1088,7 +1149,7 @@ class Parser:
                 expr = Expression("NOTHING")
         elif val == ord('{'):
             expr = Expression("ARRAY")
-            expr.args = self.parseArgList(is_cond)
+            expr.args = self.parseArgList(is_cond, True)
             self.eatSpace()
             if self.peekChar() == '}':
                 self.getChar()
@@ -1622,8 +1683,8 @@ class Parser:
                 port = gNodenames[name]
             else:
                 port = False
-            if name in gVariables:
-                var = gVariables[name]
+            if name in gParameters:
+                var = gParameters[name]
             else:
                 vn = findVariableInScope(name)
                 if vn in gVariables:
@@ -1676,7 +1737,7 @@ class Parser:
         if pmin.type == "NOTHING":
             error("Missing lower bound in %s" % r_or_ex)
         elif pmin.type == "NAME" and pmin.e1 in gParameters:
-            gParameters[pmin.e1].used = True
+            gParameters[pmin.e1].used += 1
         val = self.lex()
         if val == ord(';'):
             error("Incomplete %s" % r_or_ex)
@@ -1687,7 +1748,7 @@ class Parser:
         if pmax.type == "NOTHING":
             error("Missing upper bound in %s" % r_or_ex)
         elif pmax.type == "NAME" and pmax.e1 in gParameters:
-            gParameters[pmax.e1].used = True
+            gParameters[pmax.e1].used += 1
         val = self.lex()
         rend = ""
         if val == ord(']'):
@@ -1818,12 +1879,14 @@ def style( message, type=None ):
             print("    Further style comments of this type will be suppressed")
 
 
-def notice( message ):
+def notice( message, type=None ):
+    if type is None:
+        type = message
     count = 0
-    if message in gNoticeMsgDict:
-        count = gNoticeMsgDict[message]
+    if type in gNoticeMsgDict:
+        count = gNoticeMsgDict[type]
     count += 1
-    gNoticeMsgDict[message] = count
+    gNoticeMsgDict[type] = count
     if count <= gMaxNum or gMaxNum == 0:
         if len(gLineNo) > 0:
             print("NOTICE in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
@@ -1872,7 +1935,7 @@ def getSimpleValue( expr, m_or_l, char ):
     elif expr.type == "NAME":
         name = expr.e1
         if name in gParameters:
-            gParameters[name].used = True
+            gParameters[name].used += 1
             defv = gParameters[name].defv
             if defv.type == "NUMBER":
                 value = defv.number
@@ -2588,6 +2651,7 @@ def getAttributes( line, in_attrib ):
         retval[0] = ","
     retval.insert(0, line)
     return retval
+# end of getAttributes
 
 
 def parseMacro( line ):
@@ -2654,6 +2718,7 @@ def parseMacro( line ):
                     mac.used = True
         else:
             error("Missing macro name after `define")
+# end of parseMacro
 
 
 def parseUndef( line ):
@@ -2861,6 +2926,7 @@ def expandMacro( line ):
             start = i
         pos = findFirstUnquotedTic(line, start)
     return line
+# end of expandMacro
 
 
 def verifyEndScope( what ):
@@ -3070,19 +3136,10 @@ def parseDisciplineLine( line ):
 # end of parseDisciplineLine
 
 
-# clear all module-scope items for new module
-def initializeModule():
-    global gParameters, gVariables, gMacros, gHiddenState, gPortnames, gNodenames, gBranches, gBlocknames, gNoiseTypes
-    gParameters  = {}
-    gVariables   = {}
+# reset all macros
+def resetMacros():
+    global gMacros
     gMacros      = {}
-    gHiddenState = {}
-    gPortnames   = {}
-    gNodenames   = {}
-    gBranches    = {}
-    gBlocknames  = {}
-    gNoiseTypes  = []
-
     # predefined macros
     mac1 = Macro("__VAMS_ENABLE__", "")
     mac1.used = True
@@ -3100,6 +3157,25 @@ def initializeModule():
             mac = Macro(parts[0], "")
         mac.used = True
         gMacros[mac.name] = mac
+
+
+# clear all module-scope items for new module
+def initializeModule():
+    global gParameters, gVariables, gHiddenState, gPortnames, gPortlist, gNodenames, gBranches, \
+           gMultScaled, gUsesDDT, gContribs, gBlocknames, gNoiseTypes
+    gParameters  = {}
+    gVariables   = {}
+    gHiddenState = {}
+    gPortnames   = {}
+    gPortlist    = ""
+    gNodenames   = {}
+    gBranches    = {}
+    gMultScaled  = {}
+    gUsesDDT     = False
+    gContribs    = {}
+    gBlocknames  = {}
+    gNoiseTypes  = []
+    resetMacros()
 
     # $temperature, $vt, $mfactor, $abstime
     temp = Variable("$temperature", "real", False, "", 0)
@@ -3140,6 +3216,13 @@ def printModuleSummary():
         print("\nModule: %s" % gModuleName)
     else:  # pragma: no cover
         print("\nNo module declaration found")
+    if gVerbose:
+        print("\nPorts: %s" % gPortlist)
+        if len(gNodenames):
+            printList(gNodenames.keys(), "Internal nodes: ", 70)
+        if len(gMultScaled):
+            start = "Ports/nodes that get mult scaling: "
+            printList(gMultScaled.keys(), start, 70)
     if len(gParameters):
         inst_parms = {}
         model_parms = {}
@@ -3218,7 +3301,7 @@ def printModuleSummary():
 
 
 def parseModuleDecl( line ):
-    global gModuleName
+    global gModuleName, gPortlist
 
     parser = Parser(line)
     val = parser.lex()
@@ -3258,6 +3341,9 @@ def parseModuleDecl( line ):
             else:
                 port = Port(pname, gFileName[-1], gLineNo[-1])
                 gPortnames[pname] = port
+                if gPortlist != "":
+                    gPortlist += ", "
+                gPortlist += pname
             val = parser.lex()
             if val == ord(','):
                 val = parser.lex()
@@ -3331,6 +3417,7 @@ def parseFunction( line ):
 
 
 def parseParamDecl( line, attribs ):
+    global gCheckMultFactors
     in_module = True
 
     parm_or_alias = ""
@@ -3432,6 +3519,8 @@ def parseParamDecl( line, attribs ):
         # insert into global map
         if valid and in_module:
             gParameters[pname] = parm
+            if pname in gMultFactors:
+                gCheckMultFactors = 1
 
         if val == ord('['):
             parm.range = parser.getBusRange()
@@ -3459,11 +3548,11 @@ def parseParamDecl( line, attribs ):
         if parm_or_alias == "aliasparam":
             if parm.defv.type == "NAME" and parm.defv.e1 in gParameters:
                 parm.type = gParameters[parm.defv.e1].type
-                gParameters[parm.defv.e1].used = True
+                gParameters[parm.defv.e1].used += 1
             else:
                 error("Default value for aliasparam '%s' must be a parameter" % pname)
             val = parser.lex()
-            parm.used = True
+            parm.used += 1
             parm.is_alias = True
 
         else:
@@ -3497,7 +3586,7 @@ def parseParamDecl( line, attribs ):
                 if dep == pname:
                     error("Parameter '%s' default value may not depend on itself" % pname)
                 elif dep in gParameters:
-                    gParameters[dep].used = True
+                    gParameters[dep].used += 1
                     if parm.model and not gParameters[dep].model:
                         if parm.defv.type == "NAME" and parm.defv.e1 == dep:
                             error("Default value of model parameter '%s' is an instance parameter '%s'"
@@ -3562,7 +3651,7 @@ def parseParamDecl( line, attribs ):
                             parm.exclude.append(exclude.number)
                         elif exclude.type == "NAME":
                             if exclude.e1 in gParameters:
-                                gParameters[exclude.e1].used = True
+                                gParameters[exclude.e1].used += 1
                             else:
                                 warning("Parameter range 'exclude %s' is not valid" % exclude.e1)
                         elif exclude.type == "NOTHING":
@@ -3804,6 +3893,8 @@ def parsePortDirection( line ):
                         if port.discipline != "":
                             error("Duplicate specification of discipline for port (terminal) '%s'" % pname)
                         port.discipline = ptype
+                        if ptype == "electrical":
+                            port.mult = True
                         if bus_range:
                             if port.is_bus:
                                 if port.msb != bus_range[0] or port.lsb != bus_range[1]:
@@ -3867,8 +3958,113 @@ def checkDeclarationContext( decl_type ):
             error("%s declarations must preceed all statements" % decl_type)
 
 
+def classifyContribs():
+    global gCheckMultFactors
+    for contrib in gContribs.values():
+        acc = contrib.acc
+        func = ""
+        node1 = ""
+        node2 = ""
+        bran = ""
+        st = ""
+        for ch in acc:
+            if ch == '(':
+                if func or node1 or node2:
+                    # if (cond) I(a,b) <+ expr -> restart parsing
+                    node1 = ""
+                    node2 = ""
+                func = st
+                st = ""
+            elif ch == ',':
+                node1 = st
+                st = ""
+            elif ch == ')':
+                if node1 == "":
+                    node1 = st
+                else:
+                    node2 = st
+                st = ""
+            elif ch.isspace():
+                if func == "":
+                    st = ""
+            elif ch in ['<','>']:
+                pass
+            else:
+                st += ch
+        if node1 != "" and node1.find('[') > 0:
+            parts = node1.split('[')
+            node1 = parts[0]
+        if node2 != "" and node2.find('[') > 0:
+            parts = node2.split('[')
+            node2 = parts[0]
+        disc = ""
+        if node1 in gPortnames:
+            disc = gPortnames[node1].discipline
+        elif node1 in gNodenames:
+            disc = gNodenames[node1].discipline
+        elif node1 in gBranches:
+            bran = node1
+            br = gBranches[bran]
+            disc = br.discipline
+            node1 = br.node1
+            node2 = br.node2
+        contrib.func = func
+        contrib.node1 = node1
+        contrib.node2 = node2
+        contrib.branch = bran
+        contrib.discipline = disc
+    more = True
+    while more:
+        more = False
+        for contrib in gContribs.values():
+            if contrib.discipline == "electrical":
+                node1 = contrib.node1
+                node2 = contrib.node2
+                scale = False
+                scale = ""
+                if node1 in gPortnames:
+                    scale = True
+                    scale = node1
+                    port = gPortnames[node1]
+                    if not port.mult:
+                        port.mult = True
+                        gMultScaled[node1] = 1
+                        more = True
+                elif node1 in gNodenames and gNodenames[node1].mult:
+                    scale = True
+                    scale = node1
+                if node2 in gPortnames:
+                    scale = True
+                    scale = node2
+                    port = gPortnames[node2]
+                    if not port.mult:
+                        port.mult = True
+                        gMultScaled[node2] = 1
+                        more = True
+                elif node2 in gNodenames and gNodenames[node2].mult:
+                    scale = True
+                    scale = node2
+                if scale:
+                    if node1 in gNodenames:
+                        node = gNodenames[node1]
+                        if not node.mult:
+                            node.mult = True
+                            gMultScaled[node1] = 1
+                            more = True
+                    if node2 in gNodenames:
+                        node = gNodenames[node2]
+                        if not node.mult:
+                            node.mult = True
+                            gMultScaled[node2] = 1
+                            more = True
+                    if contrib.branch in gBranches:
+                        gBranches[contrib.branch].mult = True
+    gCheckMultFactors = 2
+# end of classifyContribs
+
+
 def registerContrib( type, node1, node2, cond_in, bias_dep_in ):
-    bias_dep = getCurrentConditions(cond_in, bias_dep_in)[1]
+    [conds, bias_dep] = getCurrentConditions(cond_in, bias_dep_in)
     bname = ""
     bprint = node1
     if node2 == "":
@@ -3877,8 +4073,11 @@ def registerContrib( type, node1, node2, cond_in, bias_dep_in ):
         else:
             bname = "UNNAMED_" + node1 + "_GND"
     else:
-        bname = "UNNAMED_" + node1 + "_" + node2
         bprint = node1 + "," + node2
+        bname = "UNNAMED_" + node2 + "_" + node1
+        if not bname in gBranches:
+            # only one unnamed branch between two nets
+            bname = "UNNAMED_" + node1 + "_" + node2
     if bname in gBranches:
         branch = gBranches[bname]
     else:
@@ -3898,6 +4097,8 @@ def registerContrib( type, node1, node2, cond_in, bias_dep_in ):
             branch.lhs_pot = 1
     if branch.lhs_flow + branch.lhs_pot > 2:
         warning("Switch branch (%s) with bias-dependent condition" % bprint)
+    if branch.lhs_flow and branch.lhs_pot and conds == "":
+        warning("Switch branch (%s) collapsed by %s contribution" % (bprint, type))
 
 
 def getFactors( expr ):
@@ -3911,7 +4112,7 @@ def getFactors( expr ):
                 ret += gVariables[vname].factors
     elif expr.type == "FUNCCALL":
         ret.append(expr.e1)
-        if expr.e1 in ["ddt", "ddx"]:
+        if expr.e1 in ["ddt", "ddx", "white_noise", "flicker_noise"]:
             ret += getFactors(expr.args[0])
     elif expr.type == "*":
         ret += getFactors(expr.e1)
@@ -3934,11 +4135,13 @@ def getFactors( expr ):
 
 def countMultFactors( mname, factors ):
     count = 0
+    errs = []
     for fac in factors:
         if fac == mname:
             count += 1
-        elif fac in gMultFactors:
+        elif fac in gMultFactors and fac not in errs:
             error("Contribution has unexpected factor of %s (expected %s)" % (fac, mname))
+            errs.append(fac)
     if count > 1:
         error("Contribution has extra factor of %s" % mname)
 
@@ -4156,7 +4359,7 @@ def checkParmsAndVars():
     mult_q  = getPrimaryParameter("mult_q",  "MULT_Q")
     mult_fn = getPrimaryParameter("mult_fn", "MULT_FN")
     if mult_i or mult_q or mult_fn:
-        if not mult_i or not mult_q or (not mult_fn and "flicker_noise" in gNoiseTypes):
+        if not mult_i or (not mult_q and gUsesDDT) or (not mult_fn and "flicker_noise" in gNoiseTypes):
             if len(not_lower) == 0:
                 error("Parameters mult_i, mult_q, mult_fn must be implemented together.")
             else:
@@ -4214,6 +4417,87 @@ def checkParmsAndVars():
                 error("Operating-point variable '%s' is only conditionally assigned a value" % var.name)
                 gLineNo.pop()
                 gFileName.pop()
+            if gSuperfluous and var.used and var.accesses and not var.range and var.name not in gHiddenState:
+                if var.oppt:
+                    # oppt variable used at end
+                    acc = Access("USE", var.declare[0], 999999, 0, [])
+                    var.accesses.append(acc)
+                first_unused_set = 0
+                for i in range(len(var.accesses)):
+                    acc_i = var.accesses[i]
+                    if acc_i.type == "USE":
+                        have_unused = False
+                        #for j in range(i-1,first_unused_set-1,-1):
+                        for j in range(i):
+                            acc_j = var.accesses[j]
+                            for cond in acc_j.cond:
+                                if not acc_j.used and  acc_j.type == "SET":
+                                    have_unused = True
+                        if have_unused:
+                            set_conditions = []
+                            for j in range(i-1,first_unused_set-1,-1):
+                                acc_j = var.accesses[j]
+                                done = False
+                                for cond in acc_j.cond:
+                                    if acc_j.type == "SET":
+                                        if cond == acc_i.cond:
+                                            # used under same conditions as set
+                                            acc_j.used = True
+                                            done = True
+                                            break
+                                        if not cond:
+                                            # set with no conditions
+                                            acc_j.used = True
+                                            done = True
+                                            break
+                                        acc_j.used = True
+                                        if set_conditions:
+                                            set_conditions = mergeConditions(set_conditions, cond)
+                                        else:
+                                            set_conditions = acc_j.cond
+                                if done:
+                                    break
+                            if acc_i.loop:
+                                for j in range(i):
+                                    acc_j = var.accesses[j]
+                                    if acc_j.loop and acc_j.type == "SET":
+                                        acc_j.used = True
+                zini = False
+                for acc in var.accesses:
+                    if acc.type == "SET":
+                        if acc.zini:
+                            if zini:
+                                if gVerbose:
+                                    gFileName.append(acc.file)
+                                    gLineNo.append(acc.line)
+                                    notice("Repeated initialization of %s=0" % var.name, "RepeatedInit")
+                                else:
+                                    gFileName.append(zini.file)
+                                    gLineNo.append(zini.line)
+                                    if zini.file == acc.file:
+                                        notice("Repeated initialization of %s=0, also line %d" % (var.name, acc.line))
+                                    else:
+                                        notice("Repeated initialization of %s=0" % var.name)
+                                        gFileName[-1] = acc.file
+                                        gLineNo[-1] = acc.line
+                                        notice("Repeated initialization of %s=0" % var.name)
+                                gFileName.pop()
+                                gLineNo.pop()
+                            else:
+                                zini = acc
+                    else:
+                        zini = False
+                    if acc.type == "SET" and not acc.used:
+                        gFileName.append(acc.file)
+                        gLineNo.append(acc.line)
+                        if not acc.zini:
+                            #notice("Superfluous assignment to %s" % var.name, "SuperfluousAssign")
+                            notice("Superfluous assignment to %s" % var.name)
+                        elif gVerbose:
+                            #notice("Unnecessary initialization of %s=0" % var.name, "UnnecessaryInit")
+                            notice("Unnecessary initialization of %s=0" % var.name)
+                        gFileName.pop()
+                        gLineNo.pop()
             if var.oppt and var.name.lower() in param_names_lower:
                 parname = ""
                 for par in gParameters.values():
@@ -4255,7 +4539,7 @@ def checkParmsAndVars():
     for mac in gMacros.values():
         if gVerbose and not mac.used:
             notice("Macro '%s' is never used" % mac.name)
-# end of check checkParmsAndVars
+# end of checkParmsAndVars
 
 
 def findVariableInScope( name ):
@@ -4286,6 +4570,7 @@ def getIdentifierType( name ):
 
 
 def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt, do_warn ):
+    global gUsesDDT
     [conds, bias_dep] = getCurrentConditions(Expression("NOTHING"), bias_dep_in)
     biases = []
     ddt_call = 0
@@ -4306,6 +4591,7 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt
         elif dep == "ddt":
             is_set = True
             ddt_call = 1
+            gUsesDDT = True
             found = True
         else:
             is_set = False
@@ -4314,6 +4600,17 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt
         if vn in gVariables:
             found = True
             gVariables[vn].used = True
+            if do_warn:
+                accesses = gVariables[vn].accesses
+                if len(accesses) and accesses[-1].type == "USE" and accesses[-1].cond == [conds]:
+                    pass
+                else:
+                    access = Access("USE", gFileName[-1], gLineNo[-1], gSubline, [conds])
+                    for lt in gLoopTypes:
+                        if lt in ["for", "repeat", "while"]:
+                            access.loop = True
+                            break
+                    gVariables[vn].accesses.append(access)
             if bias_dep < gVariables[vn].bias_dep:
                 bias_dep = gVariables[vn].bias_dep
             for bias in gVariables[vn].biases:
@@ -4348,7 +4645,8 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt
                         error("Reference to aliasparam '%s' should use parameter '%s'" % (dep, par))
                     else:
                         error("Reference to aliasparam '%s'" % dep)
-                gParameters[dep].used = True
+                if do_warn:
+                    gParameters[dep].used += 1
                 is_set = True
             elif dep in gPortnames or dep in gNodenames:
                 if bias_dep == 0:
@@ -4385,6 +4683,16 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt
         error("%s argument involving ddt()" % unset_message)
     return [bias_dep, biases, ddt_call]
 # end of checkDependencies
+
+
+def registerLoopVariableUse( loop_cond ):
+    deps = loop_cond.getDependencies(False, False)
+    conds = getCurrentConditions(Expression("NOTHING"), 0)[0]
+    for dep in deps:
+        vn = findVariableInScope(dep)
+        if vn in gVariables:
+            access = Access("USE", gFileName[-1], gLineNo[-1], gSubline, [conds])
+            gVariables[vn].accesses.append(access)
 
 
 # split on "&&", but watch out for parentheses
@@ -4575,14 +4883,14 @@ def checkCondForBiasDepEquality( cond ):
     return ret
 
 
-def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, biases_in, ddt_in, for_var, set_by_func, fname, argnum ):
+def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, bias_in, ddt_in, for_var, set_by_func, fname, argnum ):
     found = False
     vn = findVariableInScope(varname)
     if vn in gVariables:
         var = gVariables[vn]
         found = True
         [conds, bias_dep] = getCurrentConditions(cond_in, bias_dep_in)
-        biases = biases_in
+        biases = bias_in
         if var.type == "integer":
             if bias_dep > 1:
                 bias_dep = 1
@@ -4609,6 +4917,15 @@ def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, biases_in, ddt_
             else:
                 oldconds = var.conditions
                 var.conditions = mergeConditions(oldconds, conds)
+        zero_init = False
+        if rhs and rhs.type == "NUMBER" and rhs.number == 0 and not conds:
+            zero_init = True
+        access = Access("SET", gFileName[-1], gLineNo[-1], gSubline, [conds], zero_init)
+        for lt in gLoopTypes:
+            if lt in ["for", "repeat", "while"]:
+                access.loop = True
+                break
+        var.accesses.append(access)
         if conds == "" or var.bias_dep < bias_dep:
             var.bias_dep = bias_dep
         elif bias_dep == 0 and var.bias_dep > 0:
@@ -4629,10 +4946,11 @@ def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, biases_in, ddt_
                     if mname in deps and mname not in factors:
                         error("Variable '%s' has an invalid dependence on %s" % (varname, mname))
             if not first_assign and conds != "" and (len(var.factors) > 0 or len(factors) > 0):
-                for mname in gMultFactors:
-                    if (mname in factors and mname not in var.factors) or \
-                       (mname not in factors and mname in var.factors):
-                        error("Variable '%s' depends on %s differently in if/else blocks" % (varname, mname))
+                if var.non_zero_assign and (rhs.type != "NUMBER" or rhs.number != 0):
+                    for mname in gMultFactors:
+                        if (mname in factors and mname not in var.factors) or \
+                           (mname not in factors and mname in var.factors):
+                            error("Variable '%s' depends on %s differently in if/else blocks" % (varname, mname))
             if conds == "" or first_assign:
                 var.zeros = zeros
                 var.factors = factors
@@ -4645,6 +4963,8 @@ def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, biases_in, ddt_
                     var.factors = [fac for fac in var.factors if fac in factors]
                 else:
                     var.factors = []
+            if rhs.type != "NUMBER" or rhs.number != 0:
+                var.non_zero_assign = True
         else:
             var.zeros = []
             var.factors = []
@@ -4913,27 +5233,40 @@ def checkBinning( vname, t_0, t_1, t_2, t_3, t_4, t_5, line ):
 # end of checkBinning
 
 
-# for if and while
-gConditionForNextStmt = Expression("NOTHING")
-gConditionForLastStmt = Expression("NOTHING")
-gCondBiasDForNextStmt = 0
-gCondBiasDForLastStmt = 0
+# for if, while, for
+gLoopTypeForNextStmt = []
+gLoopTypeForLastStmt = []
+gConditionForNextStmt = []
+gConditionForLastStmt = []
+gCondBiasDForNextStmt = []
+gCondBiasDForLastStmt = []
 
 
 def parseOther( line ):
-    global gConditionForNextStmt, gConditionForLastStmt
-    global gCondBiasDForNextStmt, gCondBiasDForLastStmt
     global gStatementInCurrentBlock
     global gLastDisplayTask, gLastLineWasEvent
 
-    this_cond = gConditionForNextStmt
-    gConditionForNextStmt = Expression("NOTHING")
-    last_cond = gConditionForLastStmt
-    gConditionForLastStmt = Expression("NOTHING")
-    this_c_bd = gCondBiasDForNextStmt
-    gCondBiasDForNextStmt = 0
-    last_c_bd = gCondBiasDForLastStmt
-    gCondBiasDForLastStmt = 0
+    if gLoopTypeForNextStmt:
+        this_loop = gLoopTypeForNextStmt.pop()
+    else:
+        this_loop = ""
+    last_loop = gLoopTypeForLastStmt
+    if gConditionForNextStmt:
+        this_cond = gConditionForNextStmt.pop()
+    else:
+        this_cond = Expression("NOTHING")
+    if gConditionForLastStmt:
+        last_cond = gConditionForLastStmt.pop()
+    else:
+        last_cond = Expression("NOTHING")
+    if gCondBiasDForNextStmt:
+        this_c_bd = gCondBiasDForNextStmt.pop()
+    else:
+        this_c_bd = 0
+    if gCondBiasDForLastStmt:
+        last_c_bd = gCondBiasDForLastStmt.pop()
+    else:
+        last_c_bd = 0
     analog_block = "None"
 
     parser = Parser(line)
@@ -4953,6 +5286,8 @@ def parseOther( line ):
         if keywd == "analog":
             gStatementInCurrentBlock = True
             analog_block = "analog"
+            if gCheckMultFactors == 1:
+                classifyContribs()
             val = parser.lex()
             keywd = parser.getString()
             if keywd == "initial":
@@ -4962,7 +5297,7 @@ def parseOther( line ):
 
     if parser.isNumber() or (keywd == "default" and parser.peekToken() == ":"):
         if len(gScopeList) > 0 and gScopeList[-1].startswith("CASE::"):
-            last_val = 0
+            case_val = 0
             if parser.isNumber():
                 # case 0: begin ...
                 scope = gScopeList[-1]
@@ -4970,8 +5305,8 @@ def parseOther( line ):
                 this_cond.e1 = Expression("NAME")
                 this_cond.e1.e1 = scope[6:]
                 this_cond.e2 = Expression("NUMBER")
-                last_val = parser.getNumber()
-                this_cond.e2.number = last_val
+                case_val = parser.getNumber()
+                this_cond.e2.number = case_val
             else:
                 # default: (assume no hidden state if "default" is present)
                 this_cond = Expression("NOTHING")
@@ -4984,8 +5319,8 @@ def parseOther( line ):
                     new_cond.e1 = Expression("NAME")
                     new_cond.e1.e1 = scope[6:]
                     new_cond.e2 = Expression("NUMBER")
-                    last_val = parser.getNumber()
-                    new_cond.e2.number = last_val
+                    case_val = parser.getNumber()
+                    new_cond.e2.number = case_val
                     this_cond = Expression("||")
                     this_cond.e1 = old_cond
                     this_cond.e2 = new_cond
@@ -4996,11 +5331,11 @@ def parseOther( line ):
                 if val == ord(')'):
                     val = parser.lex()
                 else:
-                    error("Missing ')' after case value %d" % last_val)
+                    error("Missing ')' after case value %d" % case_val)
             if val == ord(':'):
                 val = parser.lex()
             else:
-                error("Expected ':' after case value %d" % last_val)
+                error("Expected ':' after case value %d" % case_val)
 
     # if, else, for, while, repeat, begin, end
     if parser.isIdentifier():
@@ -5010,7 +5345,6 @@ def parseOther( line ):
             gStatementInCurrentBlock = True
 
         if keywd == "end":
-            #warning("pop scope '%s'" % gScopeList[-1])
             if len(gScopeList) > 0:
                 scope = gScopeList.pop()
                 col = scope.find("::")
@@ -5018,6 +5352,8 @@ def parseOther( line ):
                     error("Found 'end' instead of 'end%s'" % scope[0:col].lower())
             else:
                 error("Found 'end' without corresponding 'begin'")
+            if len(gLoopTypes) > 0:
+                last_loop = gLoopTypes.pop()
             if len(gConditions) > 0:
                 last_cond = gConditions.pop()
             if len(gCondBiasDep) > 0:
@@ -5029,6 +5365,8 @@ def parseOther( line ):
             else:
                 analog_block = "None"
             val = parser.lex()
+            if last_loop in ["for", "repeat", "while"] and last_cond.type != "NOTHING":
+                registerLoopVariableUse(last_cond)
             if parser.isIdentifier():
                 keywd = parser.getString()
             elif val == 0:
@@ -5058,8 +5396,8 @@ def parseOther( line ):
                 keywd = parser.getString()
             elif val == 0:
                 # statement on next line
-                gConditionForNextStmt = this_cond
-                gCondBiasDForNextStmt = this_c_bd
+                gConditionForNextStmt.append(this_cond)
+                gCondBiasDForNextStmt.append(this_c_bd)
 
         if keywd == "if":
             new_cond = parser.getExpression(True)
@@ -5072,7 +5410,7 @@ def parseOther( line ):
                 deps = []
             else:
                 deps = new_cond.getDependencies(False, False)
-            [bias_dep, biases, ddt] = checkDependencies(deps, "If condition depends on", 0, True, True, True)
+            [bias_dep, biases, ddt] = checkDependencies(deps, "If condition depends on", 0, "if", True, True)
             if this_cond.type == "NOTHING":
                 this_cond = new_cond
             elif new_cond.type == "NOTHING":
@@ -5093,22 +5431,17 @@ def parseOther( line ):
                 keywd = parser.getString()
                 # expect begin, but could be if (cond) var = value;
                 if keywd == "if":
+                    rest = "if " + parser.getRestOfLine()
+                    gConditionForNextStmt.append(this_cond)
+                    gCondBiasDForNextStmt.append(this_c_bd)
+                    hold_cond = this_cond
+                    hold_c_bd = this_c_bd
+                    parseOther(rest)
+                    this_cond = hold_cond
+                    this_c_bd = hold_c_bd
+                    val = parser.lex()
                     # if (A) if (B) ... becomes if (A&&B)
                     # TODO: doesn't handle subsequent else
-                    new_cond = parser.getExpression(True)
-                    deps = new_cond.getDependencies(False, False)
-                    [bias_dep, biases, ddt] = checkDependencies(deps, "If condition depends on", 0, True, True, True)
-                    old_cond = this_cond
-                    this_cond = Expression("&&")
-                    this_cond.e1 = old_cond
-                    this_cond.e2 = new_cond
-                    if bias_dep > 1 and checkCondForBiasDepEquality(new_cond):
-                        bias_dep = 3
-                        warning("Bias-dependent '%s': if %s" % (new_cond.type, new_cond.asString()))
-                    if bias_dep == 2:
-                        bias_dep = 1
-                    this_c_bd = bias_dep
-                    val = parser.lex()
             if parser.isIdentifier():
                 keywd = parser.getString()
             elif val == ord(';'):
@@ -5116,11 +5449,12 @@ def parseOther( line ):
                 val = parser.lex()
             elif val == 0:
                 # statement on next line
-                gConditionForNextStmt = this_cond
-                gCondBiasDForNextStmt = this_c_bd
+                gConditionForNextStmt.append(this_cond)
+                gCondBiasDForNextStmt.append(this_c_bd)
 
         if keywd == "for":
             # for (init; cond; incr)
+            this_loop = keywd
             varname = ""
             val = parser.lex()
             if val == ord('('):
@@ -5165,7 +5499,7 @@ def parseOther( line ):
             this_cond = parser.getExpression(True)
             if this_cond.type != "NOTHING":
                 deps = this_cond.getDependencies(False, False)
-                [bias_dep, biases, ddt] = checkDependencies(deps, "For loop condition depends on", 0, True, True, True)
+                [bias_dep, biases, ddt] = checkDependencies(deps, "For loop condition depends on", 0, "for", True, True)
                 val = parser.lex()
             else:
                 error("Missing condition in 'for' loop")
@@ -5219,10 +5553,13 @@ def parseOther( line ):
                     error("expected 'begin' after 'for'")
             elif val == 0:
                 # statement on next line
-                gConditionForNextStmt = this_cond
-                gCondBiasDForNextStmt = this_c_bd
+                gLoopTypeForNextStmt.append(this_loop)
+                this_loop = ""
+                gConditionForNextStmt.append(this_cond)
+                gCondBiasDForNextStmt.append(this_c_bd)
 
         if keywd == "repeat":
+            this_loop = keywd
             this_cond = parser.getExpression()
             if this_cond.type != "NUMBER" or not this_cond.is_int:
                 error("Expression for 'repeat' should be an integer")
@@ -5233,13 +5570,16 @@ def parseOther( line ):
                     error("expected 'begin' after 'repeat'")
             elif val == 0:
                 # statement on next line
-                gConditionForNextStmt = this_cond
-                gCondBiasDForNextStmt = this_c_bd
+                gLoopTypeForNextStmt.append(this_loop)
+                this_loop = ""
+                gConditionForNextStmt.append(this_cond)
+                gCondBiasDForNextStmt.append(this_c_bd)
 
         if keywd == "while":
+            this_loop = keywd
             this_cond = parser.getExpression(True)
             deps = this_cond.getDependencies(False, False)
-            [bias_dep, biases, ddt] = checkDependencies(deps, "While condition depends on", 0, True, True, True)
+            [bias_dep, biases, ddt] = checkDependencies(deps, "While condition depends on", 0, "while", True, True)
             this_c_bd = bias_dep
             val = parser.lex()
             if parser.isIdentifier():
@@ -5248,8 +5588,10 @@ def parseOther( line ):
                     error("expected 'begin' after 'while'")
             elif val == 0:
                 # statement on next line
-                gConditionForNextStmt = this_cond
-                gCondBiasDForNextStmt = this_c_bd
+                gLoopTypeForNextStmt.append(this_loop)
+                this_loop = ""
+                gConditionForNextStmt.append(this_cond)
+                gCondBiasDForNextStmt.append(this_c_bd)
 
         if keywd == "generate":
             # generate i (start, stop [, incr])
@@ -5321,7 +5663,7 @@ def parseOther( line ):
                 if keywd == "if":
                     new_cond = parser.getExpression(True)
                     deps = new_cond.getDependencies(False, False)
-                    [bias_dep, biases, ddt] = checkDependencies(deps, "If condition depends on", 0, True, True, True)
+                    [bias_dep, biases, ddt] = checkDependencies(deps, "If condition depends on", 0, "if", True, True)
                     if this_cond.type == "NOTHING":
                         this_cond = new_cond
                     else:
@@ -5338,10 +5680,11 @@ def parseOther( line ):
                     val = parser.lex()
             elif val != 0:
                 error("Unexpected token %d after 'begin'" % val)
-            #warning("push scope '%s'" % bname)
             gScopeList.append(bname)
+            gLoopTypes.append(this_loop)
             gConditions.append(this_cond)
             gCondBiasDep.append(this_c_bd)
+            this_loop = ""
             this_cond = Expression("NOTHING")
             this_c_bd = 0
             gAnalogBlock.append(analog_block)
@@ -5350,7 +5693,7 @@ def parseOther( line ):
             var = parser.getExpression()
             if var.type == "NAME":
                 varname = var.e1
-                [bias_dep, biases, ddt] = checkDependencies([varname], "Case statement depends on", 0, True, True, True)
+                [bias_dep, biases, ddt] = checkDependencies([varname], "Case statement depends on", 0, "case", True, True)
                 if bias_dep:
                     error("Case statement variable '%s' is bias-dependent" % varname)
                 elif getIdentifierType(varname) != "integer":
@@ -5636,11 +5979,11 @@ def parseOther( line ):
                             # if (A) X=0; else X=1;
                             rest = keywd + " " + parser.getRestOfLine()
                             keywd = ""
-                            gConditionForLastStmt = this_cond
-                            gCondBiasDForLastStmt = this_c_bd
+                            gConditionForLastStmt.append(this_cond)
+                            gCondBiasDForLastStmt.append(this_c_bd)
                             parseOther(rest)
-                            this_cond = gConditionForLastStmt
-                            this_c_bd = gCondBiasDForLastStmt
+                            this_cond = gConditionForLastStmt.pop()
+                            this_c_bd = gCondBiasDForLastStmt.pop()
                         elif keywd == "if":
                             parser.ungetChars("if")
                             if gStyle:
@@ -5656,11 +5999,11 @@ def parseOther( line ):
                 val = parser.lex()
                 if val == 0 and keywd != "":
                     if keywd == "end":
-                        gConditionForLastStmt = this_cond
-                        gCondBiasDForLastStmt = this_c_bd
+                        gConditionForLastStmt.append(this_cond)
+                        gCondBiasDForLastStmt.append(this_c_bd)
                         parseOther(keywd)
-                        this_cond = gConditionForLastStmt
-                        this_c_bd = gCondBiasDForLastStmt
+                        this_cond = gConditionForLastStmt.pop()
+                        this_c_bd = gCondBiasDForLastStmt.pop()
                     else:  # pragma: no cover
                         fatal("Unexpected '%s' after assignment" % keywd)
 
@@ -5764,9 +6107,11 @@ def parseOther( line ):
                             ddt = rhs.ddtCheck()
                             if ddt > 1:
                                 error("Contribution to '%s' is nonlinear in ddt()" % acc_ref)
-                        has_mult = [mname for mname in gMultFactors if mname in gParameters]
-                        if len(has_mult) > 0:
-                            if dname == "electrical" and acc == "I":
+                        if gCheckMultFactors:
+                            if acc == "I" and \
+                                    ((nname1 in gPortnames and gPortnames[nname1].mult) or \
+                                     (nname1 in gNodenames and gNodenames[nname1].mult) or \
+                                     (nname1 in gBranches and gBranches[nname1].mult)) :
                                 checkMultFactors(rhs)
                             else:
                                 for mult in gMultFactors:
@@ -5811,8 +6156,9 @@ def parseOther( line ):
                     else:
                         error("Missing ';' after contribution")
 
-                elif keywd in ["$strobe", "$display", "$monitor", "$write", "$debug", "$bound_step", "$discontinuity",
-                               "$fatal", "$error", "$warning", "$finish", "$stop"]:
+                elif keywd in ["$strobe", "$display", "$write", "$monitor", "$debug", "$bound_step", "$discontinuity",
+                               "$fstrobe", "$fdisplay", "$fwrite", "$fmonitor",
+                               "$fatal", "$error", "$warning", "$info", "$finish", "$stop"]:
                     gStatementInCurrentBlock = True
                     if val == ord('('):
                         args = parser.parseArgList()
@@ -5829,7 +6175,7 @@ def parseOther( line ):
                             if val == ord('('):
                                 arg = ()
                             notice("$error() preferred over %s%s" % (keywd, arg))
-                    elif keywd == "$debug":
+                    elif keywd in ["$debug", "$monitor"]:
                         warning("%s() may degrade performance" % keywd)
                     elif keywd in ["$strobe", "$display", "$write"]:
                         gLastDisplayTask = [keywd, gFileName[-1], gLineNo[-1]]
@@ -5838,7 +6184,10 @@ def parseOther( line ):
                         deps = []
                         for arg in args:
                             deps += arg.getDependencies(False, False)
-                        checkDependencies(deps, "Task %s references" % keywd, this_c_bd, False, False, True)
+                        bias_dep = checkDependencies(deps, "Task %s references" % keywd, this_c_bd, False, False, True)[0]
+                        if bias_dep and keywd in ["$strobe", "$display", "$write", "$warning", "$info",
+                                                  "$fstrobe", "$fdisplay", "$fwrite", "$fmonitor"]:
+                            warning("bias-dependent %s() may degrade performance" % keywd)
                         val = parser.lex()
                         if val == ord(')'):
                             val = parser.lex()
@@ -5858,10 +6207,28 @@ def parseOther( line ):
                         if gCompactModel:
                             warning("Task '%s' should not be used in a compact model" % keywd)
                     else:
+                        strpos = 0
+                        posstr = "First"
+                        if keywd in ["$fstrobe", "$fdisplay", "$fwrite", "$fmonitor"]:
+                            badarg = False
+                            if args[0].type == "NAME":
+                                vn = findVariableInScope(args[0].e1)
+                                if vn in gVariables:
+                                    var = gVariables[vn]
+                                    if var.type != "integer":
+                                        badarg = True
+                                else:
+                                    badarg = True
+                            else:
+                                badarg = True
+                            if badarg:
+                                error("First argument to %s must be a file descriptor (integer variable)" % keywd)
+                            strpos = 1
+                            posstr = "Second"
                         if len(args) == 0:
                             error("Expected at least 1 argument for %s" % keywd)
-                        elif args[0].type != "STRING":
-                            error("First argument to %s must be a string" % keywd)
+                        elif args[strpos].type != "STRING":
+                            error("%s argument to %s must be a string" % (posstr, keywd))
                     if val == ord(';'):
                         val = parser.lex()
                         if val == ord(';'):
@@ -5904,7 +6271,7 @@ def parseOther( line ):
                 val = parser.lex()
                 if val == ord('('):
                     arg.type = "FUNCCALL"
-                    arg.args = parser.parseArgList(False)
+                    arg.args = parser.parseArgList()
                     for farg in arg.args:
                         deps = farg.getDependencies(False, False)
                         checkDependencies(deps, "%s event references" % arg.e1, this_c_bd, False, False, True)
@@ -5960,8 +6327,11 @@ def parseOther( line ):
     else:
         error("Unexpected %s" % formatChar(val))
 
-    gConditionForLastStmt = this_cond
-    gCondBiasDForLastStmt = this_c_bd
+    gLoopTypeForLastStmt.append(this_loop)
+    if this_loop in ["for", "repeat", "while"] and this_cond.type != "NOTHING":
+        registerLoopVariableUse(this_cond)
+    gConditionForLastStmt.append(this_cond)
+    gCondBiasDForLastStmt.append(this_c_bd)
 
     if val != 0:
         rest = ""
@@ -5991,11 +6361,19 @@ def getCurrentConditions( cond_in, c_bd_in ):
     bias_dep = c_bd_in
     if cond_in.type != "NOTHING":
         conds = cond_in.asString()
+    for cond in gConditionForNextStmt:
+        if cond.type != "NOTHING":
+            if conds != "":
+                conds += "&&"
+            conds += cond.asString()
     for cond in gConditions:
         if cond.type != "NOTHING":
             if conds != "":
                 conds += "&&"
             conds += cond.asString()
+    for c_bd in gCondBiasDForNextStmt:
+        if c_bd > bias_dep:
+            bias_dep = c_bd
     for c_bd in gCondBiasDep:
         if c_bd > bias_dep:
             bias_dep = c_bd
@@ -6188,16 +6566,22 @@ def handleCompilerDirectives( line ):
 # end of handleCompilerDirectives
 
 
-def preProcessNatures( lines ):
+def preProcessNaturesAndContribs( lines ):
     # preprocess so idt_natures are defined
     for line in lines:
         gLineNo[-1] += 1
         if line.startswith("nature") and len(gScopeList) == 0:
             parseNatureDecl(line, False)
+        elif line.find("<+") > 0:
+            parts = line.split("<+")
+            contrib = Contribution(parts[0].strip())
+            key = len(gContribs)
+            gContribs[key] = contrib
 
 
 def parseLines( lines ):
     global gStatementInCurrentBlock
+    global gSubline
     prev_line = ""
     prev_attribs = []
     in_attribute = ""
@@ -6205,6 +6589,7 @@ def parseLines( lines ):
     j = 0
     while j < len(lines):
         gLineNo[-1] += 1
+        gSubline = 0
         line = lines[j]
         j += 1
 
@@ -6219,6 +6604,7 @@ def parseLines( lines ):
         while i < len(parts):
             part = parts[i]
             i += 1
+            gSubline += 1
             part = part.strip()
             if part == "":
                 continue
@@ -6589,7 +6975,9 @@ def parseFile( filename ):
     optional_indent = 0
     optional_indent_reason = ""
     single_line_indent = 0
+    single_line_keywd = [0, ""]
     previous_single_indent = 0
+    previous_single_keywd = [0, ""]
     indent_module = -1
     first_module_indent = 0
     ifdef_depth = 0
@@ -6685,7 +7073,7 @@ def parseFile( filename ):
                                     first_inside_ifdef = gLineNo[-1]
                     stripped = orig_line.strip()
                     if stripped != "":
-                        this_indent = required_indent+single_line_indent
+                        this_indent = required_indent + single_line_indent
                         if stripped[0:2] == "//":
                             if indent_define == 0 and stripped.find("`define") > 0:
                                 this_indent = 0
@@ -6750,6 +7138,7 @@ def parseFile( filename ):
                     if in_multiline_define:
                         this_indent += special_define_indent
                     previous_single_indent = single_line_indent
+                    previous_single_keywd = single_line_keywd
                     if single_line_indent > 0:
                         if keywd != "begin":
                             this_indent += single_line_indent
@@ -6959,6 +7348,7 @@ def parseFile( filename ):
                             optional_indent_reason = "module"
                         elif keywd in ["analog", "if", "else", "for", "repeat", "while", "generate", "@"]:
                             single_line_indent = previous_single_indent + gSpcPerInd
+                            single_line_keywd = [gLineNo[-1], keywd]
                             num_parens = 0
                             while val != 0:
                                 val = parser.lex()
@@ -6968,6 +7358,10 @@ def parseFile( filename ):
                                         optional_indent = 0
                                         required_indent += gSpcPerInd
                                         single_line_indent = 0
+                                        if previous_single_indent > 0:
+                                            gLineNo.append(previous_single_keywd[0])
+                                            style("Missing begin/end for '%s'" % previous_single_keywd[1])
+                                            gLineNo.pop()
                                     elif string == "end":
                                         required_indent -= gSpcPerInd
                                 elif val == ord('('):
@@ -7107,7 +7501,7 @@ def parseFile( filename ):
 
     # process the lines
     gLineNo[-1] = 0
-    preProcessNatures(lines_to_parse)
+    preProcessNaturesAndContribs(lines_to_parse)
     gLineNo[-1] = 0
     parseLines(lines_to_parse)
 
@@ -7134,7 +7528,7 @@ This program runs checks on Verilog-A models to detect common problems, includin
 - hidden state (variables used before assigned)
 - unused parameters or variables
 - division by zero for parameters (1/parm where parm's range allows 0)
-- integer division (1/2 = 0)
+- integer division (1/2 = 0) and domain errors for ln() and sqrt()
 - incorrect ddx() usage
 - ports without direction and/or discipline
 - incorrect access functions for discipline
@@ -7171,6 +7565,7 @@ argpar.add_argument('-n', '--no_style',       help='turn off style checking', ac
 argpar.add_argument(      '--not_compact',    help='not a compact model', action='store_false')
 argpar.add_argument(      '--print_defaults', help='print default values for all parameters', action='store_true')
 argpar.add_argument('-s', '--indent_spaces',  help='number of spaces to indent', type=int, default=4)
+argpar.add_argument(      '--superfluous',    help='report superfluous assignments', action='store_true')
 argpar.add_argument('-v', '--verbose',        help='turn on verbose mode', action='store_true')
 argpar.add_argument(      '--version',        help='print version number', action=VersionAction, nargs=0)
 cmdargs       = argpar.parse_args()
@@ -7181,6 +7576,7 @@ gBinning      = cmdargs.binning
 gFixIndent    = cmdargs.fix_indent
 gCompactModel = cmdargs.not_compact
 gPrDefVals    = cmdargs.print_defaults
+gSuperfluous  = cmdargs.superfluous
 if cmdargs.all:
     gMaxNum = 0
 else:
