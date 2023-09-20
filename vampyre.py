@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.8.8, 1-Sept-2022
+# version 1.8.9, 07-Dec-2022
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -49,7 +49,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.8.8"
+gVersionNumber = "1.8.9"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -812,7 +812,9 @@ class Parser:
     escaped = False
     while ch != qstr or escaped:
         ch = self.getChar()
-        if escaped:
+        if ch == "":
+            break
+        elif escaped:
             str += ch
             ch = " "
             escaped = False
@@ -3700,6 +3702,7 @@ def checkParmsAndVars():
     not_lower = []
     not_upper = []
     some_units = False
+    some_inst_parms = False
     param_names_lower = []
     for branch in gBranches.values():
         n1 = branch.node1
@@ -3727,6 +3730,10 @@ def checkParmsAndVars():
             gLineNo.pop()
             gFileName.pop()
     for par in gParameters.values():
+        if par.inst:
+            some_inst_parms = True
+            break
+    for par in gParameters.values():
         gFileName.append(par.declare[0])
         gLineNo.append(par.declare[1])
         if not par.used:
@@ -3753,7 +3760,7 @@ def checkParmsAndVars():
                         par2 = gParameters[defv]
                         if not par2.inst:
                             warning("Temperature offset parameter '%s' (aliased as %s) should be an instance parameter" % (par2.name, par.name))
-            elif not par.inst:
+            elif some_inst_parms and not par.inst:
                 warning("Temperature offset parameter '%s' should be an instance parameter" % par.name)
         param_names_lower.append(par.name.lower())
         if par.name.lower() == par.name:
@@ -3957,6 +3964,17 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt
                 if do_warn:
                     error("Reference to branch '%s' without access function" % dep)
                 is_set = True
+            elif dep.find(".") > 0:
+                parts = dep.split(".")
+                dname = ""
+                if parts[0] in gPortnames:
+                    dname = gPortnames[parts[0]].discipline
+                elif parts[0] in gNodenames:
+                    dname = gNodenames[parts[0]].discipline
+                if dname != "" and dname in gDisciplines:
+                    #disc = gDisciplines[dname]
+                    if len(parts) == 3 and parts[1] in ["potential", "flow"] and parts[2] == "abstol":
+                        is_set = True
         if not is_set and do_warn:
             if dep in gVAMSkeywords:
                 error("%s Verilog-AMS keyword '%s'" % (unset_message, dep))
@@ -4125,6 +4143,19 @@ def reformatConditions( conds ):
                 cond = "!(" + cond[idx+4:]
             idx = cond.find("NOT(")
         return cond
+
+
+def checkCondForBiasDepEquality( cond ):
+    ret = False
+    if cond.type == "==" or cond.type == "!=":
+        deps = cond.getDependencies(False, False)
+        [bias_dep, biases, ddt] = checkDependencies(deps, "", 0, True, True, False)
+        if bias_dep > 1:
+            ret = True
+    elif cond.type == "&&":
+        if checkCondForBiasDepEquality(cond.e1) or checkCondForBiasDepEquality(cond.e2):
+            ret = True
+    return ret
 
 
 def markVariableAsSet( varname, rhs, bias_dep_in, cond_in, biases_in, ddt_in, for_var, set_by_func, fname, argnum ):
@@ -4477,6 +4508,11 @@ def parseOther( line ):
         val = parser.lex()
     keywd = ""
 
+    got_paren = False
+    if val == ord('(') and len(gScopeList) > 0 and gScopeList[-1].startswith("CASE::"):
+        got_paren = True
+        val = parser.lex()
+
     if parser.isIdentifier():
         keywd = parser.getString()
         if keywd == "analog":
@@ -4521,6 +4557,11 @@ def parseOther( line ):
                     val = parser.lex()
                 else:
                     error("Expected number after ',' in case value list")
+            if got_paren:
+                if val == ord(')'):
+                    val = parser.lex()
+                else:
+                    error("Missing ')' after case value %d" % last_val)
             if val == ord(':'):
                 val = parser.lex()
             else:
@@ -4604,7 +4645,7 @@ def parseOther( line ):
                 this_cond = Expression("&&")
                 this_cond.e1 = old_cond
                 this_cond.e2 = new_cond
-            if bias_dep > 1 and (new_cond.type == "==" or new_cond.type == "!="):
+            if bias_dep > 1 and checkCondForBiasDepEquality(new_cond):
                 bias_dep = 3
                 warning("Bias-dependent '%s': if %s" % (new_cond.type, new_cond.asString()))
             if bias_dep == 2:
@@ -4624,7 +4665,7 @@ def parseOther( line ):
                     this_cond = Expression("&&")
                     this_cond.e1 = old_cond
                     this_cond.e2 = new_cond
-                    if bias_dep > 1 and (new_cond.type == "==" or new_cond.type == "!="):
+                    if bias_dep > 1 and checkCondForBiasDepEquality(new_cond):
                         bias_dep = 3
                         warning("Bias-dependent '%s': if %s" % (new_cond.type, new_cond.asString()))
                     if bias_dep == 2:
@@ -4811,6 +4852,8 @@ def parseOther( line ):
                     val = parser.lex()
                 if val == ord(')'):
                     val = parser.lex()
+                    if parser.isIdentifier():
+                        keywd = parser.getString()
                 else: # pragma: no cover
                     valid = False
             else:
@@ -4849,7 +4892,7 @@ def parseOther( line ):
                         this_cond = Expression("&&")
                         this_cond.e1 = old_cond
                         this_cond.e2 = new_cond
-                    if bias_dep > 1 and (new_cond.type == "==" or new_cond.type == "!="):
+                    if bias_dep > 1 and checkCondForBiasDepEquality(new_cond):
                         bias_dep = 3
                         warning("Bias-dependent '%s': if %s" % (new_cond.type, new_cond.asString()))
                     if bias_dep == 2:
@@ -5403,12 +5446,8 @@ def parseOther( line ):
                     arg.type = "FUNCCALL"
                     arg.args = parser.parseArgList(False)
                     for farg in arg.args:
-                        # should actually test all dependencies of farg
-                        if farg.type == "NAME":
-                            if farg.e1 in gParameters:
-                                gParameters[farg.e1].used = True
-                            elif farg.e1 in gVariables:
-                                gVariables[farg.e1].used = True
+                        deps = farg.getDependencies(False, False)
+                        checkDependencies(deps, "%s event references" % arg.e1, this_c_bd, False, False, True)
                     if parser.peekChar() == ')':
                         parser.getChar()
                         val = parser.lex()
@@ -5904,6 +5943,8 @@ def parseLines( lines ):
                             elif ch == ')':
                                 num_parens -= 1
                         nextln = lines[tmpj].strip()
+                        if num_parens > 0 and nextln == "end":
+                            break
                         if num_parens > 0 or tmpline[-1] in "+-*/%><!&|=~^?" or \
                                 (nextln != "" and nextln[0] in "+-*/%><!&|=~^?"):
                             nextln = lines[tmpj]
@@ -6025,6 +6066,30 @@ def fixSpaces(line, keywd):
     else:
         ret += "\n"
     return ret
+
+
+def countParentheses(line, num_parens, num_attrib):
+    in_quote = False
+    for i in range(len(line)):
+        ch = line[i]
+        if ch == '"':
+            in_quote = not in_quote
+        if not in_quote:
+            if ch == '(':
+                if i+1 < len(line) and line[i+1] == '*':
+                    if num_attrib > 0:
+                        error("Nested attribute")
+                    num_attrib += 1
+                else:
+                    num_parens += 1
+            elif ch == ')':
+                if i > 0 and line[i-1] == '*':
+                    if num_attrib <= 0:
+                        error("Unexpected '*)'")
+                    num_attrib -= 1
+                else:
+                    num_parens -= 1
+    return [num_parens, num_attrib]
 
 
 def parseFile( filename ):
@@ -6301,6 +6366,11 @@ def parseFile( filename ):
                                 is_vams_compdir = True
                                 if gFixIndent and indent > this_indent:
                                     fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
+                            if not token in ["ifdef", "ifndef", "else", "elsif", "endif"]:
+                                if continued_line == "parentheses":
+                                    warning("Unclosed parenthesis before this point (opened on line %d)" % (gLineNo[-1]-paren_continued_lines))
+                                    unclosed_parens = 0
+                                    continued_line = ""
                             if token == "define":
                                 indent_before_define = required_indent
                                 if required_indent > 0:
@@ -6410,6 +6480,8 @@ def parseFile( filename ):
                                 val = parser.lex()
                                 if parser.isIdentifier():
                                     keywd = parser.getString()
+                                else:
+                                    val = 0
                     if keywd != "":
                         if keywd == "module" or keywd == "macromodule":
                             optional_indent = gSpcPerInd
@@ -6472,13 +6544,16 @@ def parseFile( filename ):
                                 rest = parser.peekRestOfLine()
                                 if rest.find("<+"):
                                     may_be_assign_or_contrib = 2
-                    elif in_case_block and parser.isNumber():
-                        while val != 0:
+                    elif in_case_block:
+                        if val == ord('('):
                             val = parser.lex()
-                            if parser.isIdentifier():
-                                if parser.getString() == "begin":
-                                    optional_indent = 0
-                                    required_indent += gSpcPerInd
+                        if parser.isNumber():
+                            while val != 0:
+                                val = parser.lex()
+                                if parser.isIdentifier():
+                                    if parser.getString() == "begin":
+                                        optional_indent = 0
+                                        required_indent += gSpcPerInd
                     if bad_indent and continued_line != "" and indent > this_indent:
                         bad_indent = False
                     elif indent_this_define == 0 and not is_vams_compdir:
@@ -6497,34 +6572,31 @@ def parseFile( filename ):
                     if continued_line == "no_semicolon":
                         if stripped != "" and stripped[-1] == ';':
                             continued_line = ""
-                    elif continued_line == "parentheses":
-                        for ch in line:
-                            if ch == '(':
-                                unclosed_parens += 1
-                            elif ch == ')':
-                                unclosed_parens -= 1
-                        if unclosed_parens <= 0:
-                            unclosed_parens = 0
-                            continued_line = ""
+                    elif continued_line == "parentheses" or continued_line == "attributes":
+                        [unclosed_parens, num_attrib] = countParentheses(line, unclosed_parens, 1)
+                        if continued_line == "parentheses":
+                            if unclosed_parens <= 0:
+                                unclosed_parens = 0
+                                continued_line = ""
+                            elif stripped == "end" or (stripped != "" and stripped[-1] == ';'):
+                                warning("Unclosed parenthesis before this point (opened on line %d)" % (gLineNo[-1]-paren_continued_lines))
+                                unclosed_parens = 0
+                                continued_line = ""
+                        else:
+                            if num_attrib <= 0:
+                                continued_line = ""
                     else:
                         continued_line = ""
                         if stripped != "" and stripped[-1] != ';':
                             if may_be_assign_or_contrib:
                                 continued_line = "no_semicolon"
                             else:
-                                num_parens = 0
-                                in_quote = False
-                                for ch in line:
-                                    if ch == '"':
-                                        in_quote = not in_quote
-                                    if not in_quote:
-                                        if ch == '(':
-                                            num_parens += 1
-                                        elif ch == ')':
-                                            num_parens -= 1
+                                [num_parens, num_attrib] = countParentheses(line, 0, 0)
                                 if num_parens > 0:
                                     continued_line = "parentheses"
                                     unclosed_parens = num_parens
+                                if num_attrib > 0:
+                                    continued_line = "attributes"
                 if gFixIndent:
                     fixedLines.append(fixed_line)
                     if fixed_line != orig_line:
