@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # VAMPyRE
 # Verilog-A Model Pythonic Rule Enforcer
-# version 1.0, 26-June-2020
+# version 1.1, 28-July-2020
 #
 # intended for checking for issues like:
 # 1) hidden state (variables used before assigned)
@@ -14,6 +14,10 @@
 # 8) unnamed noise sources
 # 9) use of features not appropriate for compact models
 #10) various issues of poor coding style
+#11) compliance with CMC Verilog-A Code Standards:
+#   - use of lower-case identifiers
+#   - proper use of tref and dtemp
+#   - proper use of the multiplicity attribute
 #
 # Copyright (c) 2020 Analog Devices, Inc.
 # 
@@ -152,6 +156,10 @@ for fn in ["idtmod", "absdelay", "transition", "slew", "last_crossing",
            "laplace_nd", "laplace_np", "laplace_zd", "laplace_zp",
            "zi_nd", "zi_np", "zi_zd", "zi_zp"]:
     gMathFunctions[fn] = 99
+
+# units for multiplicity checking
+gUnitsMultiply = ["A", "Amps", "F", "Farads", "C", "coul", "Coulomb", "W", "Watts", "A/V", "S", "mho", "A*V", "A*V/K", "A/K", "C/K", "s*W/K"]
+gUnitsDivide   = ["Ohm", "Ohms", "V/A", "K/W"]
 
 
 ################################################################################
@@ -494,6 +502,7 @@ class Parser:
     self.number = 0
     self.ternary_condition = Expression("NOTHING")
     self.is_int = False
+    self.escaped = False
     self.string = ""
 
   def isNumber(self):
@@ -507,6 +516,9 @@ class Parser:
   def isString(self):
     global TOKEN_STRING
     return self.token == TOKEN_STRING
+
+  def isEscaped(self):
+       return self.escaped
 
   def getNumber(self):
     return self.number
@@ -675,6 +687,7 @@ class Parser:
             ch = self.getChar()
         if self.string != "":
             self.token = TOKEN_IDENTIFIER
+            self.escaped = True
         else:
             ch = '\\'
             self.token = ord(ch)
@@ -809,9 +822,9 @@ class Parser:
 
   # expression parsing - watch for order of operations
 
-  def parseArgList(self):
+  def parseArgList(self, is_cond=False):
     args = []
-    expr = self.getExpression()
+    expr = self.getExpression(is_cond)
     if expr.type == "NOTHING" and self.peekChar() == ')':
         return []
     args.append(expr)
@@ -825,7 +838,7 @@ class Parser:
         ch = self.peekChar()
     return args
 
-  def parsePrimary(self):
+  def parsePrimary(self, is_cond):
     val = self.lex()
     if self.isIdentifier():
         expr = Expression("NAME")
@@ -838,7 +851,7 @@ class Parser:
         expr = Expression("STRING")
         expr.e1 = self.getString()
     elif val == ord('('):
-        expr = self.getExpression()
+        expr = self.getExpression(is_cond)
         self.eatSpace()
         if self.peekChar() == ')':
             self.getChar()
@@ -849,7 +862,7 @@ class Parser:
         if self.peekChar() == '{':
             self.getChar()
             expr = Expression("ARRAY")
-            expr.args = self.parseArgList()
+            expr.args = self.parseArgList(is_cond)
             self.eatSpace()
             if self.peekChar() == '}':
                 self.getChar()
@@ -861,7 +874,7 @@ class Parser:
             expr = Expression("NOTHING")
     elif val == ord('{'):
         expr = Expression("ARRAY")
-        expr.args = self.parseArgList()
+        expr.args = self.parseArgList(is_cond)
         self.eatSpace()
         if self.peekChar() == '}':
             self.getChar()
@@ -881,8 +894,8 @@ class Parser:
         self.getChar()
     return expr
 
-  def parsePostfix(self):
-    expr = self.parsePrimary()
+  def parsePostfix(self, is_cond):
+    expr = self.parsePrimary(is_cond)
     if expr.type == "NAME":
         ch = self.peekChar()
         if ch == '(':
@@ -910,7 +923,7 @@ class Parser:
             elif ch == ')':
                 args = []
             else:
-                args = self.parseArgList()
+                args = self.parseArgList(is_cond)
             expr = Expression("FUNCCALL")
             expr.e1 = fname
             expr.args = args
@@ -957,6 +970,13 @@ class Parser:
                     name = args[0]
                     if name.type != "STRING":
                         error("First argument to %s must be a string" % fname)
+                    elif name.e1 == "\"gmin\"":
+                        if len(args) == 1: 
+                            warning("$simparam(\"gmin\") call should provide default value 0 for second argument")
+                        else:
+                            defval = args[1]
+                            if defval.type != "NUMBER" or defval.number != 0:
+                                warning("$simparam(\"gmin\", %s) should use 0 for default value" % defval.asString())
                 else:
                     error("Incorrect number of arguments (%d) for function %s (expect 1 or 2)"
                           % (len(args), fname))
@@ -998,11 +1018,11 @@ class Parser:
                     expr.is_int = True
     return expr
 
-  def parsePrefix(self):
+  def parsePrefix(self, is_cond):
     oper = self.peekOper()
     if oper == "-":               # Unary minus
         oper = self.getOper()
-        arg = self.parsePrefix()
+        arg = self.parsePrefix(is_cond)
         if arg.type == "NUMBER":
             expr = arg
             expr.number = -arg.number
@@ -1012,40 +1032,40 @@ class Parser:
             expr.is_int = arg.is_int
     elif oper == "+":             # Unary plus
         oper = self.getOper()
-        expr = self.parsePrefix()
+        expr = self.parsePrefix(is_cond)
     elif oper == "!":             # Logical not
         oper = self.getOper()
-        arg = self.parsePrefix()
+        arg = self.parsePrefix(is_cond)
         expr = Expression(oper)
         expr.e1 = arg
     elif oper == "~":             # Bitwise not
         oper = self.getOper()
         warning("Unexpected bitwise operator '%s'" % oper)
-        arg = self.parsePrefix()
+        arg = self.parsePrefix(is_cond)
         expr = Expression(oper)
         expr.e1 = arg
     else:
-        expr = self.parsePostfix()
+        expr = self.parsePostfix(is_cond)
     return expr
 
-  def parsePower(self):
-    expr = self.parsePrefix()
+  def parsePower(self, is_cond):
+    expr = self.parsePrefix(is_cond)
     if( self.peekOper() == "**" ):
         oper = self.getOper()
         lhs = expr
-        rhs = self.parsePower()
+        rhs = self.parsePower(is_cond)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
         expr.is_int = lhs.is_int and rhs.is_int
     return expr
 
-  def parseMultiplicative(self):
-    expr = self.parsePower()
+  def parseMultiplicative(self, is_cond):
+    expr = self.parsePower(is_cond)
     while self.peekOper() in [ "*", "/", "%"]:
         oper = self.getOper()
         lhs = expr
-        rhs = self.parsePower()
+        rhs = self.parsePower(is_cond)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
@@ -1060,126 +1080,133 @@ class Parser:
                         warning("Possible division by zero for parameter %s" % pname)
     return expr
 
-  def parseAdditive(self):
-    expr = self.parseMultiplicative()
+  def parseAdditive(self, is_cond):
+    expr = self.parseMultiplicative(is_cond)
     while self.peekOper() in [ "+", "-"]:
         oper = self.getOper()
         lhs = expr
-        rhs = self.parseMultiplicative()
+        rhs = self.parseMultiplicative(is_cond)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
         expr.is_int = lhs.is_int and rhs.is_int
     return expr
 
-  def parseShift(self):
-    expr = self.parseAdditive()
+  def parseShift(self, is_cond):
+    expr = self.parseAdditive(is_cond)
     while self.peekOper() in ["<<", ">>", "<<<", ">>>"]:
         oper = self.getOper()
         lhs = expr
-        rhs = self.parseAdditive()
+        rhs = self.parseAdditive(is_cond)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
     return expr
 
-  def parseRelation(self):
-    expr = self.parseShift()
+  def parseRelation(self, is_cond):
+    expr = self.parseShift(is_cond)
     while self.peekOper() in ["<", ">", "<=", ">="]:
         oper = self.getOper()
         lhs = expr
-        rhs = self.parseShift()
+        rhs = self.parseShift(is_cond)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
     return expr
 
-  def parseEquality(self):
-    expr = self.parseRelation()
-    while self.peekOper() in ["==", "!=", "===", "!=="]:
+  def parseEquality(self, is_cond):
+    expr = self.parseRelation(is_cond)
+    oper = self.peekOper()
+    if is_cond and oper == '=':
+         error("Found '=' in condition; should be '=='")
+         oper = "=="
+    while oper in ["==", "!=", "===", "!=="]:
         oper = self.getOper()
+        if is_cond and oper == '=':
+            oper = "=="
         lhs = expr
-        rhs = self.parseRelation()
+        rhs = self.parseRelation(is_cond)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
+        oper = self.peekOper()
     return expr
 
-  def parseBitOpers(self):
-    expr = self.parseEquality()
+  def parseBitOpers(self, is_cond):
+    expr = self.parseEquality(is_cond)
     while self.peekOper() in ["^~", "~^", "~&", "~|"]:
         oper = self.getOper()
         lhs = expr
-        rhs = self.parseEquality()
+        rhs = self.parseEquality(is_cond)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
     return expr
 
-  def parseBitAnd(self):
-    expr = self.parseBitOpers()
+  def parseBitAnd(self, is_cond):
+    expr = self.parseBitOpers(is_cond)
     while self.peekOper() == "&":
         oper = self.getOper()
         lhs = expr
-        rhs = self.parseBitOpers()
+        rhs = self.parseBitOpers(is_cond)
         warning("Unexpected bitwise operator '%s'" % oper)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
     return expr
 
-  def parseBitXor(self):
-    expr = self.parseBitAnd()
+  def parseBitXor(self, is_cond):
+    expr = self.parseBitAnd(is_cond)
     while self.peekOper() == "^":
         oper = self.getOper()
         lhs = expr
-        rhs = self.parseBitAnd()
+        rhs = self.parseBitAnd(is_cond)
         warning("Unexpected bitwise operator '%s'" % oper)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
     return expr
 
-  def parseBitOr(self):
-    expr = self.parseBitXor()
+  def parseBitOr(self, is_cond):
+    expr = self.parseBitXor(is_cond)
     while self.peekOper() == "|":
         oper = self.getOper()
         lhs = expr
-        rhs = self.parseBitXor()
+        rhs = self.parseBitXor(is_cond)
         warning("Unexpected bitwise operator '%s'" % oper)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
     return expr
 
-  def parseLogicalAnd(self):
-    expr = self.parseBitOr()
+  def parseLogicalAnd(self, is_cond):
+    expr = self.parseBitOr(is_cond)
     while self.peekOper() == "&&":
         oper = self.getOper()
         lhs = expr
-        rhs = self.parseBitOr()
+        rhs = self.parseBitOr(is_cond)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
     return expr
 
-  def parseLogicalOr(self):
-    expr = self.parseLogicalAnd()
+  def parseLogicalOr(self, is_cond):
+    expr = self.parseLogicalAnd(is_cond)
     while self.peekOper() == "||":
         oper = self.getOper()
         lhs = expr
-        rhs = self.parseLogicalAnd()
+        rhs = self.parseLogicalAnd(is_cond)
         expr = Expression(oper)
         expr.e1 = lhs
         expr.e2 = rhs
     return expr
 
-  def parseTernary(self):
-    cond = self.parseLogicalOr()
+  def parseTernary(self, is_cond):
+    cond = self.parseLogicalOr(is_cond)
     if( self.peekOper() == '?' ):
         self.ternary_condition = cond
         self.getOper()
-        second = self.parseTernary()
+        second = self.parseTernary(is_cond)
         has_colon = False
         if( self.peekOper() == ':' ):
             self.getOper()
@@ -1188,7 +1215,7 @@ class Parser:
             self.ternary_condition.e1 = cond
         else:
             error("Missing ':' in ternary operator")
-        third = self.parseTernary()
+        third = self.parseTernary(is_cond)
         if third.type == "NOTHING":
             if has_colon:
                 error("Missing expression after ':' in ternary operator")
@@ -1204,9 +1231,9 @@ class Parser:
         expr = cond
     return expr
 
-  def getExpression(self):
+  def getExpression(self, is_cond=False):
     self.eatSpace()
-    return self.parseTernary()
+    return self.parseTernary(is_cond)
 
   def checkBusIndex(self, name):
     if self.peekChar() == '[':
@@ -1225,13 +1252,13 @@ class Parser:
                 if port.is_bus:
                     if (index > port.msb and index > port.lsb) \
                           or (index < port.msb and index < port.lsb):
-                        error("Invalid index %d, port %s range is [%d:%d]" % (index, name, port.msb, port.lsb))
+                        error("Invalid index %d, port '%s' range is [%d:%d]" % (index, name, port.msb, port.lsb))
                 else:
                     error("Port '%s' is not a bus, cannot index" % name)
             else:
                 error("Identifier '%s' is not a vector port, cannot index" % name)
         else:
-            warning("Unsupported index for bus access %s" % sel.type)
+            warning("Unsupported index for bus access (type %s)" % sel.type)
         if self.peekChar() == ']':
             self.getChar()
             self.eatSpace()
@@ -1252,9 +1279,10 @@ class Parser:
         elif self.isIdentifier():
             name = self.getString()
             if name in gParameters:
+                gParameters[name].used = True
                 defv = gParameters[name].defv
                 if defv.type == "NUMBER":
-                        msb = defv.number
+                    msb = defv.number
                 else:
                     warning("Cannot determine range msb from '%s'" % name)
             else:
@@ -1274,18 +1302,21 @@ class Parser:
         elif self.isIdentifier():
             name = self.getString()
             if name in gParameters:
+                gParameters[name].used = True
                 defv = gParameters[name].defv
                 if defv.type == "NUMBER":
                     lsb = defv.number
                 else:
                     warning("Cannot determine range lsb from '%s'" % name)
             else:
-                error("Expected constant expression for lsb after '[', got '%s'" % name)
+                error("Expected constant expression for lsb after ':', got '%s'" % name)
         else:
             error("Expected constant expression for lsb after ':'")
+            if val == ord(']'):
+                valid = False
     if valid:
         val = self.lex()
-        if val != ord(']'):
+        if val != ord(']'): # pragma: no cover
             valid = False
     if valid:
         val = self.lex()
@@ -1293,7 +1324,7 @@ class Parser:
     else:
         while val != ord(']'):
             val = self.lex()
-            if val == 0:
+            if val == 0: # pragma: no cover
                 fatal("Parse error looking for ']'")
     return bus_range
 
@@ -1351,13 +1382,15 @@ def error( message ):
             print("    Further errors of this type will be suppressed")
 
 
-def warning( message ):
+def warning( message, type=None ):
     global gWarningMsgDict, gMaxNum, gFileName, gLineNo
+    if type is None:
+        type = message
     count = 0
-    if message in gWarningMsgDict:
-        count = gWarningMsgDict[message]
+    if type in gWarningMsgDict:
+        count = gWarningMsgDict[type]
     count += 1
-    gWarningMsgDict[message] = count
+    gWarningMsgDict[type] = count
     if count <= gMaxNum or gMaxNum == 0:
         if len(gLineNo) > 0:
             print("WARNING in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
@@ -1582,9 +1615,9 @@ def checkConditionsExclude( pname, exval, extra_cond ):
     return excludes
 
 
-def checkIdentifierCollisions( basename, name, type ):
+def checkIdentifierCollisions( basename, name, escaped, type ):
     valid = True
-    if basename in gVAMSkeywords:
+    if basename in gVAMSkeywords and not escaped:
         error("%s '%s' collides with Verilog-AMS keyword" % (type,name))
         valid = False
     elif name == gModuleName:
@@ -1956,14 +1989,16 @@ def parseNatureDecl( line, defined ):
         fatal("Parse error looking for 'nature'")
 
     name = ""
+    escaped = False
     val = parser.lex()
     if parser.isIdentifier():
         name = parser.getString()
+        escaped = parser.isEscaped()
     else: # pragma: no cover
         fatal("Parse error looking for nature name")
 
     if name != "":
-        valid = checkIdentifierCollisions(name, name, "Nature")
+        valid = checkIdentifierCollisions(name, name, escaped, "Nature")
         if valid:
             nature = Nature(name, defined)
             gNatures[name] = nature
@@ -2048,13 +2083,15 @@ def parseDisciplineDecl( line ):
         fatal("Parse error looking for 'discipline'")
 
     name = ""
+    escaped = False
     val = parser.lex()
     if parser.isIdentifier():
         name = parser.getString()
+        escaped = parser.isEscaped()
     else: # pragma: no cover
         fatal("Parse error looking for discipline name")
 
-    valid = checkIdentifierCollisions(name, name, "Discipline")
+    valid = checkIdentifierCollisions(name, name, escaped, "Discipline")
     if valid:
         disc = Discipline(name)
         gDisciplines[name] = disc
@@ -2104,6 +2141,10 @@ def parseDisciplineLine( line ):
                     if gDisciplines[disc].flow != "":
                         error("Duplicate specification of '%s' for discipline '%s'" % (attrib, disc))
                     gDisciplines[disc].flow = nature
+                    if nature in gNatures:
+                        units = gNatures[nature].units.strip('"')
+                        if units != "" and not units in gUnitsMultiply:
+                            gUnitsMultiply.append(units)
         elif attrib == "domain":
             val = parser.lex()
             if parser.isIdentifier() or parser.isString():
@@ -2198,6 +2239,7 @@ def parseFunction( line ):
 
     fname = ""
     ftype = ""
+    escaped = False
     val = parser.lex()
     if parser.isIdentifier():
         ftype = parser.getString()
@@ -2205,6 +2247,7 @@ def parseFunction( line ):
     val = parser.lex()
     if parser.isIdentifier():
         fname = parser.getString()
+        escaped = parser.isEscaped()
 
     if len(gScopeList) == 0:
         error("Functions may not be defined outside a module")
@@ -2217,7 +2260,7 @@ def parseFunction( line ):
         error("Invalid type '%s' for function '%s'" % (ftype, fname))
 
     gScopeList.append("FUNCTION::" + fname)
-    valid = checkIdentifierCollisions(fname, fname, "Function")
+    valid = checkIdentifierCollisions(fname, fname, escaped, "Function")
     if valid:
         gCurrentFunction = Function(fname, ftype)
         gUserFunctions[fname] = gCurrentFunction
@@ -2262,9 +2305,11 @@ def parseParamDecl( line, attribs ):
         ptype = "alias"
 
     pname = ""
+    escaped = False
     val = parser.lex()
     if parser.isIdentifier():
         pname = parser.getString()
+        escaped = parser.isEscaped()
     elif val == ord('='):
         if ptype == "alias":
             error("Missing aliasparam name")
@@ -2299,7 +2344,7 @@ def parseParamDecl( line, attribs ):
             val = parser.lex()
 
     if pname != "":
-        valid = checkIdentifierCollisions(pname, pname, "Parameter")
+        valid = checkIdentifierCollisions(pname, pname, escaped, "Parameter")
     else:
         valid = False
     # insert into global map
@@ -2410,9 +2455,16 @@ def parseVariableDecl( line, attribs ):
 
     oppt = False
     if len(attribs) > 0:
+        units = ""
+        multi = ""
         for i in range(0, len(attribs), 2):
-            if attribs[i] in ["units", "desc"]:
+            if attribs[i] == "units":
                 oppt = True
+                units = attribs[i+1].strip('"')
+            elif attribs[i] == "desc":
+                oppt = True
+            elif attribs[i] == "multiplicity":
+                multi = attribs[i+1]
 
     vtype = ""
     vname = ""
@@ -2430,14 +2482,23 @@ def parseVariableDecl( line, attribs ):
 
         if parser.isIdentifier():
             str = parser.getString()
+            escaped = parser.isEscaped()
             scope = getCurrentScope()
             vname = scope + str
-            valid = checkIdentifierCollisions(str, vname, "Variable")
+            valid = checkIdentifierCollisions(str, vname, escaped, "Variable")
             # insert into global map
             if valid and in_module:
                 var = Variable(vname, vtype, oppt, gFileName[-1], gLineNo[-1])
                 if oppt:
                     var.used = True
+                    if units in gUnitsMultiply:
+                        if multi != "\"multiply\"":
+                            warning("Operating-point variable %s should have multiplicity=\"multiply\"" % var.name, "multiplicity")
+                    elif units in gUnitsDivide:
+                        if multi != "\"divide\"":
+                            warning("Operating-point variable %s should have multiplicity=\"divide\"" % var.name, "multiplicity")
+                    elif multi != "":
+                        warning("Unexpected multiplicity=%s for operating-point variable %s with units %s" % (multi, var.name, units), "multiplicity")
                 gVariables[vname] = var
                 if len(gScopeList) > 0 and gScopeList[-1].startswith("FUNCTION::"):
                     if gCurrentFunction:
@@ -2527,6 +2588,7 @@ def parsePortDirection( line ):
 
         if parser.isIdentifier():
             pname = parser.getString()
+            escaped = parser.isEscaped()
             if len(gScopeList) > 0 and gScopeList[-1].startswith("FUNCTION::"):
                 if gCurrentFunction:
                     if pname in gCurrentFunction.args:
@@ -2534,7 +2596,7 @@ def parsePortDirection( line ):
                             # input x; real x;
                             scope = getCurrentScope()
                             vname = scope + pname
-                            valid = checkIdentifierCollisions(pname, vname, "Variable")
+                            valid = checkIdentifierCollisions(pname, vname, escaped, "Variable")
                             # insert into global map
                             if valid and in_module:
                                 var = Variable(vname, ptype, False, gFileName[-1], gLineNo[-1])
@@ -2562,13 +2624,13 @@ def parsePortDirection( line ):
             elif ptype == "real" or ptype == "integer":
                 scope = getCurrentScope()
                 vname = scope + pname
-                valid = checkIdentifierCollisions(pname, vname, "Variable")
+                valid = checkIdentifierCollisions(pname, vname, escaped, "Variable")
                 # insert into global map
                 if valid and in_module:
                     var = Variable(vname, ptype, False, gFileName[-1], gLineNo[-1])
                     gVariables[vname] = var
             else:
-                valid = checkIdentifierCollisions(pname, pname, "Port name")
+                valid = checkIdentifierCollisions(pname, pname, escaped, "Port name")
                 # set direction in global map
                 if valid and in_module:
                     port = gPortnames[pname]
@@ -2670,19 +2732,70 @@ def checkPorts():
             error("No direction specified for port (terminal) '%s'" % port.name)
         if port.discipline == "":
             error("No discipline specified for port (terminal) '%s'" % port.name)
+        if port.name.lower() != port.name:
+            if port.name.upper() != port.name:
+                warning("Mixed-case port name '%s'" % port.name)
+            elif gStyle:
+                style("Port names should be lower-case ('%s' not '%s')" % (port.name.lower(), port.name))
         gLineNo.pop()
         gFileName.pop()
 
 
 def checkParmsAndVars():
     global gFileName, gLineNo, gDebug
+    temp = gVariables["$temperature"]
+    has_tref = False
+    has_dtemp = False
+    not_lower = []
+    not_upper = []
+    param_names_lower = []
     for par in gParameters.values():
+        gFileName.append(par.declare[0])
+        gLineNo.append(par.declare[1])
         if not par.used:
-            gFileName.append(par.declare[0])
-            gLineNo.append(par.declare[1])
             warning("Parameter '%s' was never used" % par.name)
-            gLineNo.pop()
-            gFileName.pop()
+        if par.name.lower() == "tref":
+            has_tref = True
+        elif par.name.lower() == "tnom":
+            has_tref = True
+        if par.name.lower() in ["dtemp", "trise"]:
+            has_dtemp = True
+            if par.is_alias:
+                defv = par.defv
+                if defv.type == "NAME":
+                    defv = defv.e1
+                    if defv in gParameters:
+                        par2 = gParameters[defv]
+                        if not par2.inst:
+                            warning("Temperature offset parameter '%s' (aliased as %s) should be an instance parameter" % (par2.name, par.name))
+            elif not par.inst:
+                warning("Temperature offset parameter '%s' should be an instance parameter" % par.name)
+        param_names_lower.append(par.name.lower())
+        if par.name.lower() != par.name:
+            not_lower.append(par.name)
+        if par.name.upper() != par.name:
+            not_upper.append(par.name)
+        gLineNo.pop()
+        gFileName.pop()
+    if temp.used > 0:
+        if not has_tref:
+            warning("Module uses $temperature but does not have 'tref'")
+        if not has_dtemp:
+            warning("Module uses $temperature but does not have 'dtemp'")
+    if len(not_lower) > 0:
+        if len(not_upper) == 0:
+            if gStyle:
+                style("Parameters should be declared in lower-case")
+        else:
+            if len(not_lower) == 1 and len(not_upper) > 5:
+                bad = not_lower[0]
+                warning("Parameters have inconsistent case (all lower-case except '%s')" % bad)
+            elif len(not_upper) == 1 and len(not_lower) > 5:
+                bad = not_upper[0]
+                warning("Parameters have inconsistent case (all upper-case except '%s')" % bad)
+            else:
+                warning("Parameters have inconsistent case (prefer all lower-case)")
+
     for var in gVariables.values():
         if var.name.startswith("FUNCTION::"):
             var.assign = 0 # suppress printing in summary
@@ -2700,7 +2813,7 @@ def checkParmsAndVars():
                                 print("    Function '%s' output argument '%s' is used because variable '%s' is used"
                                       % (fname,func.args[argno],var.name))
                     else: # pragma: no cover
-                        fatal("Programming error: function arguemnts")
+                        fatal("Programming error: function arguments")
                 else:
                     var.used = True # don't report as unused
             if var.assign == -1:
@@ -2718,6 +2831,13 @@ def checkParmsAndVars():
                 warning("Variable '%s' was never used" % var.name)
             elif var.used and var.name == "$vt":
                 warning("$vt not recommended; value differs slightly between simulators")
+            if var.oppt and var.name.lower() in param_names_lower:
+                parname = ""
+                for par in gParameters.values():
+                    if par.name.lower() == var.name.lower():
+                        parname = par.name
+                        break
+                warning("Operating-point variable '%s' differs only in case from parameter '%s'" % (var.name, parname))
     for func in gUserFunctions.values():
         if func.used:
             if len(func.outputs) > 0:
@@ -3177,7 +3297,7 @@ def parseOther( line ):
                 gCondBiasDForNextStmt = this_c_bd
 
         if keywd == "if":
-            new_cond = parser.getExpression()
+            new_cond = parser.getExpression(True)
             deps = new_cond.getDependencies(False, False)
             [bias_dep, biases] = checkDependencies(deps, "If condition depends on", 0, True, True)
             if this_cond.type == "NOTHING":
@@ -3200,7 +3320,7 @@ def parseOther( line ):
                 if keywd == "if":
                     # if (A) if (B) ... becomes if (A&&B)
                     # TODO: doesn't handle subsequent else
-                    new_cond = parser.getExpression()
+                    new_cond = parser.getExpression(True)
                     deps = new_cond.getDependencies(False, False)
                     [bias_dep, biases] = checkDependencies(deps, "If condition depends on", 0, True, True)
                     old_cond = this_cond
@@ -3267,7 +3387,7 @@ def parseOther( line ):
                     val = parser.lex()
             if val != ord(';'):
                 error("Missing ';' in for loop")
-            this_cond = parser.getExpression()
+            this_cond = parser.getExpression(True)
             if this_cond.type != "NOTHING":
                 deps = this_cond.getDependencies(False, False)
                 [bias_dep, biases] = checkDependencies(deps, "For loop condition depends on", 0, True, True)
@@ -3342,7 +3462,7 @@ def parseOther( line ):
                 gCondBiasDForNextStmt = this_c_bd
 
         if keywd == "while":
-            this_cond = parser.getExpression()
+            this_cond = parser.getExpression(True)
             deps = this_cond.getDependencies(False, False)
             [bias_dep, biases] = checkDependencies(deps, "While condition depends on", 0, True, True)
             this_c_bd = bias_dep
@@ -3363,9 +3483,10 @@ def parseOther( line ):
                 val = parser.lex()
                 if parser.isIdentifier():
                     bname = parser.getString()
+                    escaped = parser.isEscaped()
                     scope = getCurrentScope()
                     scoped_name = scope + bname
-                    valid = checkIdentifierCollisions(bname, scoped_name, "Block name")
+                    valid = checkIdentifierCollisions(bname, scoped_name, escaped, "Block name")
                     if valid:
                         gBlocknames[bname] = 1
                     val = parser.lex()
@@ -3376,7 +3497,7 @@ def parseOther( line ):
             elif parser.isIdentifier():
                 keywd = parser.getString()
                 if keywd == "if":
-                    new_cond = parser.getExpression()
+                    new_cond = parser.getExpression(True)
                     deps = new_cond.getDependencies(False, False)
                     [bias_dep, biases] = checkDependencies(deps, "If condition depends on", 0, True, True)
                     if this_cond.type == "NOTHING":
@@ -3436,6 +3557,7 @@ def parseOther( line ):
                 val = parser.token
             while parser.isIdentifier():
                 pname = parser.getString()
+                escaped = parser.isEscaped()
                 if pname in gPortnames:
                     node = gPortnames[pname]
                     if node.discipline != "":
@@ -3451,17 +3573,14 @@ def parseOther( line ):
                         error("Discipline declaration for '%s' should also have bus range [%d:%d]" % (pname, node.msb, node.lsb))
                 else:
                     # internal node
-                    if pname in gNodenames:
+                    if pname in gNodenames and gNodenames[pname].type == "ground":
                         node = gNodenames[pname]
-                        if node.type == "ground":
-                            if node.discipline == "":
-                                node.discipline = keywd
-                            else:
-                                error("Duplicate discipline declaration for ground '%s'" % pname)
+                        if node.discipline == "":
+                            node.discipline = keywd
                         else:
-                            error("Duplicate declaration of internal node '%s'" % pname)
+                            error("Duplicate discipline declaration for ground '%s'" % pname)
                     else:
-                        valid = checkIdentifierCollisions(pname, pname, "Node name")
+                        valid = checkIdentifierCollisions(pname, pname, escaped, "Node name")
                         if valid:
                             node = Port(pname, gFileName[-1], gLineNo[-1])
                             node.type = "internal"
@@ -3499,7 +3618,7 @@ def parseOther( line ):
                     else:
                         error("Cannot specify 'ground' for port '%s'" % pname)
                 else:
-                    valid = checkIdentifierCollisions(pname, pname, "Node name")
+                    valid = checkIdentifierCollisions(pname, pname, escaped, "Node name")
                     if valid:
                         node = Port(pname, gFileName[-1], gLineNo[-1])
                         node.type = "ground"
@@ -3549,7 +3668,8 @@ def parseOther( line ):
                 error("Missing ')' in branch declaration")
             while parser.isIdentifier():
                 bname = parser.getString()
-                valid = checkIdentifierCollisions(bname, bname, "Branch")
+                escaped = parser.isEscaped()
+                valid = checkIdentifierCollisions(bname, bname, escaped, "Branch")
                 if valid:
                     branch = Branch(bname)
                     branch.node1 = node1
@@ -3715,7 +3835,7 @@ def parseOther( line ):
                                 else:
                                     error("Identifier '%s' is not a port, node, or branch in potential or flow access" % nname2)
                                 if dname2 != "" and dname2 != dname:
-                                    error("Nodes %s and %s belong to different disciplines" % (nname1, nname2))
+                                    error("Nodes '%s' and '%s' belong to different disciplines" % (nname1, nname2))
                     if dname in gDisciplines:
                         disc = gDisciplines[dname]
                         fname = disc.flow
@@ -4778,7 +4898,7 @@ class versionAction(argparse.Action):
         return
     def __call__(self, parser, namespace, values, option_string=None):
         print("""
-VAMPyRE version 1.0
+VAMPyRE version 1.1
 """)
         sys.exit()
 
