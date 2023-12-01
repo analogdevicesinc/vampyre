@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """ VAMPyRE
     Verilog-A Model Pythonic Rule Enforcer
-    version 1.9.2, 1-Sept-2023
+    version 1.9.3, 01-Dec-2023
 
     intended for checking for issues like:
      1) hidden state (variables used before assigned)
@@ -51,7 +51,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.9.2"
+gVersionNumber = "1.9.3"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -100,6 +100,7 @@ gCompactModel     = True
 gCheckMultFactors = 0
 gUsesDDT          = False
 gPrDefVals        = False
+gPreProcess       = False
 
 # dictionaries to track how many of each type of message
 gErrorMsgDict   = {}
@@ -322,6 +323,7 @@ class Branch:
         self.node1 = ""
         self.node2 = ""
         self.discipline = ""  # electrical, thermal, ...
+        self.conds = []       # conditions under which contributed to
         self.lhs_flow = 0     # flow contrib: 0=no, 1=yes, 2=bias-dep condition
         self.lhs_pot  = 0     # potential contrib: 0=no, 1=yes, 2=bias-dep condition
         self.mult = False     # whether contributions to this branch need mult scaling
@@ -1344,9 +1346,9 @@ class Parser:
                             if len(args) == 1:
                                 warning("$simparam(\"gmin\") call should provide default value 0 for second argument")
                             else:
-                                defval = args[1]
-                                if defval.type != "NUMBER" or defval.number != 0:
-                                    warning("$simparam(\"gmin\", %s) should use 0 for default value" % defval.asString())
+                                defv = args[1]
+                                if defv.type != "NUMBER" or defv.number != 0:
+                                    warning("$simparam(\"gmin\", %s) should use 0 for default value" % defv.asString())
                     else:
                         error("Incorrect number of arguments (%d) for function %s (expect 1 or 2)"
                               % (len(args), fname))
@@ -1876,7 +1878,7 @@ def error( message, type=None ):
         count = gErrorMsgDict[type]
     count += 1
     gErrorMsgDict[type] = count
-    if count <= gMaxNum or gMaxNum == 0:
+    if (count <= gMaxNum or gMaxNum == 0) and not gPreProcess:
         if len(gLineNo) > 0:
             print("ERROR in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
         else:  # pragma: no cover
@@ -1893,7 +1895,7 @@ def warning( message, type=None ):
         count = gWarningMsgDict[type]
     count += 1
     gWarningMsgDict[type] = count
-    if count <= gMaxNum or gMaxNum == 0:
+    if (count <= gMaxNum or gMaxNum == 0) and not gPreProcess:
         if len(gLineNo) > 0:
             print("WARNING in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
         else:  # pragma: no cover
@@ -1910,7 +1912,7 @@ def style( message, type=None ):
         count = gStyleMsgDict[type]
     count += 1
     gStyleMsgDict[type] = count
-    if count <= gMaxNum or gMaxNum == 0:
+    if (count <= gMaxNum or gMaxNum == 0) and not gPreProcess:
         if len(gLineNo) > 0:
             print("STYLE in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
         else:  # pragma: no cover
@@ -1927,7 +1929,7 @@ def notice( message, type=None ):
         count = gNoticeMsgDict[type]
     count += 1
     gNoticeMsgDict[type] = count
-    if count <= gMaxNum or gMaxNum == 0:
+    if (count <= gMaxNum or gMaxNum == 0) and not gPreProcess:
         if len(gLineNo) > 0:
             print("NOTICE in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
         else:  # pragma: no cover
@@ -2630,7 +2632,7 @@ def getAttributes( line, in_attrib ):
                             ch = attrib[i]
                             if ch == '"':
                                 in_quote = not in_quote
-                            elif not in_quote and ch == '(' and attrib[i+1] == '*': # pragma: no cover
+                            elif not in_quote and ch == '(' and attrib[i+1] == '*':  # pragma: no cover
                                 nested = i
                                 break
                 if nested >= 0:
@@ -2758,7 +2760,7 @@ def parseMacro( line ):
                     else:
                         error("Missing ')' for macro definition")
             if i < max_i:
-                value = line[i:]
+                value = " " + line[i:].strip()
             else:
                 value = ""
             if name in gVAMScompdir:
@@ -2957,6 +2959,8 @@ def expandMacro( line ):
             rest = line[te:t2]
             if rest.find("`ifdef") > 0 or rest.find("`ifndef") > 0:  # pragma: no cover
                 fatal("Found nested `ifdef in macro text, not supported")
+            elif rest.find("`elsif") > 0:  # pragma: no cover
+                fatal("Found `elsif in macro text, not supported")
             if t1 >= 0:
                 def_text = line[te:t1]
                 not_text = line[t1+5:t2]
@@ -2972,10 +2976,13 @@ def expandMacro( line ):
             string += ifdef_text
             string += line[i:]
             line = string
-        elif name in ["else", "endif"]:   # pragma: no cover
+        elif name in ["else", "elsif", "endif"]:  # pragma: no cover
             fatal("Found `%s in macro text without corresponding `ifdef" % name)
         elif name in gVAMScompdir:
             error("Can't handle compiler directive `%s in macro text" % name)
+            start = i
+        elif name == "elseif":
+            # error printed in handleCompilerDirectives
             start = i
         else:
             if gMissingConstantsFile != "" and name[0:2] in ["M_", "P_"]:
@@ -3279,8 +3286,12 @@ def printModuleSummary():
         print("\nNo module declaration found")
     if gVerbose:
         print("\nPorts: %s" % gPortlist)
-        if len(gNodenames):
-            printList(gNodenames.keys(), "Internal nodes: ", 70)
+        if gNodenames:
+            if len(gNodenames) < 10:
+                printList(gNodenames.keys(), "Internal nodes: ", 70)
+            else:
+                print("Internal nodes:")
+                printList(gNodenames.keys(), "    ", 70)
         if len(gMultScaled):
             start = "Ports/nodes that get mult scaling: "
             printList(gMultScaled.keys(), start, 70)
@@ -3361,7 +3372,7 @@ def printModuleSummary():
 # end of printModuleSummary
 
 
-def parseModuleDecl( line ):
+def parseModuleDecl( line, attribs ):
     global gModuleName, gPortlist
 
     parser = Parser(line)
@@ -3391,6 +3402,13 @@ def parseModuleDecl( line ):
                 initializeModule()
                 print("")
         gModuleName = mname
+
+    if attribs:
+        for i in range(0, len(attribs)-1, 2):
+            if attribs[i] == "instance_parameter_list":
+                warning("Module declared with non-standard attribute (* %s *)" % attribs[i])
+            elif gVerbose and attribs[i] in ["compact_module", "compact_model"]:
+                notice("Module declared as (* %s *)" % attribs[i])
 
     val = parser.lex()
     if val == ord('('):
@@ -3493,7 +3511,7 @@ def parseParamDecl( line, attribs ):
     model = True
     units = 0
     scale = ""
-    if len(attribs) > 0:
+    if attribs:
         for i in range(0, len(attribs)-1, 2):
             if attribs[i] == "type":
                 val = attribs[i+1].lower()
@@ -3722,6 +3740,18 @@ def parseParamDecl( line, attribs ):
                         val = parser.lex()
                 else:  # pragma: no cover
                     fatal("Unexpected '%s' in parameter declaration" % string)
+
+        if parm.defv.type == "NUMBER":
+            num = parm.defv.number
+            if num in parm.exclude:
+                warning("Default value of %s=%d is excluded from range" % (parm.name, num))
+            elif parm.value_range != "nb":
+                if parm.min.type == "NUMBER" and (parm.min.number > num \
+                        or (parm.value_range in ["oc", "oo"] and parm.min.number == num)):
+                    warning("Default value of %s=%d is too small" % (parm.name, num))
+                elif parm.max.type == "NUMBER" and (parm.max.number < num \
+                        or (parm.value_range in ["co", "oo"] and parm.max.number == num)):
+                    warning("Default value of %s=%d is too large" % (parm.name, num))
 
     if val != ord(';'):
         if not parse_error:
@@ -4146,6 +4176,15 @@ def registerContrib( type, node1, node2, cond_in, bias_dep_in ):
         branch.node1 = node1
         branch.node2 = node2
         gBranches[bname] = branch
+    if branch.conds:
+        if conds:
+            if conds not in branch.conds:
+                branch.conds = mergeConditions(branch.conds, conds)
+        else:
+            branch.conds = []
+    elif conds and branch.lhs_flow == 0 and branch.lhs_pot == 0:
+        # first contribution
+        branch.conds.append(conds)
     if type == "flow":
         if bias_dep:
             branch.lhs_flow = 2
@@ -4281,6 +4320,203 @@ def checkPorts():
                 style("Port names should be lowercase ('%s' not '%s')" % (port.name.lower(), port.name))
         gLineNo.pop()
         gFileName.pop()
+
+
+def handleEqualityConditions(expr, parms, excls):
+    pname = ""
+    value = 0
+    handled = True
+    if expr.type == "FUNCCALL" and expr.e1 == "NOT" and len(expr.args) == 1:
+        expr = expr.args[0]
+        if expr.type == "==":
+            expr.type = "!="
+        elif expr.type == "!=":
+            expr.type = "=="
+        else:
+            handled = False
+    elif expr.type == "NAME":
+        if expr.e1 in gParameters:
+            pname = expr.e1
+            expr.e1 = Expression("NAME")
+            expr.e1.e1 = pname
+            expr.e2 = Expression("NUMBER")
+            expr.e2.value = 0
+            expr.type = "!="
+        else:
+            handled = False
+    if handled:
+        if expr.e1.type == "NAME" and expr.e1.e1 in gParameters:
+            pname = expr.e1.e1
+            value = expr.e2
+        elif expr.e2.type == "NAME" and expr.e2.e1 in gParameters:
+            pname = expr.e2.e1
+            value = expr.e1
+    if pname:
+        if value.type == "NUMBER":
+            val = value.number
+            if expr.type == "==":
+                if pname in parms:
+                    vals = parms[pname]
+                    if val not in vals:
+                        vals.append(val)
+                else:
+                    vals = [val]
+                parms[pname] = vals
+            else:
+                if pname in excls:
+                    vals = excls[pname]
+                    if val not in vals:
+                        vals.append(val)
+                else:
+                    vals = [val]
+                excls[pname] = vals
+        else:
+            handled = False
+    else:
+        handled = False
+    return [handled, parms, excls]
+
+
+def handleAndConditions(expr, parms, excls):
+    if expr.e1.type in ["==", "!=", "FUNCCALL", "NAME"]:
+        [ha1, parms, excls] = handleEqualityConditions(expr.e1, parms, excls)
+    else:
+        ha1 = False
+    if expr.e2.type in ["==", "!=", "FUNCCALL", "NAME"]:
+        [ha2, parms, excls] = handleEqualityConditions(expr.e2, parms, excls)
+    else:
+        ha2 = False
+    handled = False
+    if ha1 and ha2 and len(parms) == 1 and len(excls) == 1:
+        # par==1 and par!=0 is the same as par==1
+        popkey = False
+        for (k1, v1) in parms.items():
+            for (k2, v2) in excls.items():
+                if k1 == k2 and len(v2) == 1 and v2[0] not in v1:
+                    handled = True
+                    popkey = k2
+        if popkey:
+            excls.pop(popkey)
+    return [handled, parms, excls]
+
+
+def handleOrConditions(expr, parms, excls):
+    if expr.e1.type == "||":
+        [ha1, parms, excls] = handleOrConditions(expr.e1, parms, excls)
+    elif expr.e1.type in ["==", "!=", "FUNCCALL", "NAME"]:
+        [ha1, parms, excls] = handleEqualityConditions(expr.e1, parms, excls)
+    else:
+        ha1 = False
+    if expr.e2.type == "||":
+        [ha2, parms, excls] = handleOrConditions(expr.e2, parms, excls)
+    elif expr.e2.type in ["==", "!=", "FUNCCALL", "NAME"]:
+        [ha2, parms, excls] = handleEqualityConditions(expr.e2, parms, excls)
+    else:
+        ha2 = False
+    handled = ha1 and ha2
+    return [handled, parms, excls]
+
+
+def checkInternalNodes():
+    for node in gNodenames.values():
+        gFileName.append(node.declare[0])
+        gLineNo.append(node.declare[1])
+        conds = []
+        found_contrib = 0
+        bad_branch = False
+        for branch in gBranches.values():
+            if node.name in [branch.node1, branch.node2] and (branch.lhs_pot or branch.lhs_flow):
+                if branch.conds:
+                    found_contrib = 1
+                    for co in branch.conds:
+                        conds = mergeConditions(conds, co, True)
+                        if not conds:
+                            found_contrib = 2
+                            break
+                    if branch.lhs_pot == 2 and branch.lhs_flow == 0:
+                        # bias-dependent conditional voltage contribution
+                        found_contrib = 3
+                        bad_branch = branch
+                else:
+                    found_contrib = 2
+                if found_contrib == 2:
+                    break
+        if found_contrib == 1:
+            do_report = True
+            parms = {}
+            excls = {}
+            for co in conds:
+                parser = Parser(co)
+                expr = parser.getExpression()
+                handled = True
+                if expr.type in ["==", "!=", "FUNCCALL", "NAME"]:
+                    [handled, parms, excls] = handleEqualityConditions(expr, parms, excls)
+                elif expr.type == "||":
+                    [handled, parms, excls] = handleOrConditions(expr, parms, excls)
+                elif expr.type == "&&":
+                    [handled, parms, excls] = handleAndConditions(expr, parms, excls)
+                elif expr.type in [">", ">=", "<", "<="]:
+                    pname = ""
+                    if expr.e1.type == "NAME" and expr.e1.e1 in gParameters:
+                        pname = expr.e1.e1
+                    elif expr.e2.type == "NAME" and expr.e2.e1 in gParameters:
+                        pname = expr.e2.e1
+                    if pname:
+                        parms[pname] = []
+                    else:
+                        handled = False
+                else: # pragma: no cover
+                    handled = False
+                if not handled:
+                    do_report = False
+            if do_report:
+                for (pname, vals) in parms.items():
+                    parm = gParameters[pname]
+                    if parm.type == "integer" and parm.min.type == "NUMBER" and parm.max.type == "NUMBER":
+                        start = int(parm.min.number)
+                        stop = int(parm.max.number)
+                        if parm.value_range in ["oc", "oo"]:
+                            start += 1
+                        if parm.value_range in ["co", "oo"]:
+                            stop -= 1
+                        if parm.min.number >= -10 and parm.max.number <= 10:
+                            missing = []
+                            for v in range(start,stop+1):
+                                if not v in vals and v not in parm.exclude:
+                                    missing.append(v)
+                                    if pname in excls:
+                                        excl = excls[pname]
+                                        if v not in excl:
+                                            missing.pop()
+                            if not missing:
+                                pass
+                            elif len(missing) == 1:
+                                warning("No contributions to node '%s' when parameter %s=%d"
+                                        % (node.name, pname, missing[0]))
+                            elif missing:
+                                warning("No contributions to node '%s' when parameter %s=%s"
+                                        % (node.name, pname, missing))
+                        else:
+                            if len(vals) < len(range(start,stop+1)) - len(parm.exclude):
+                                warning("Contributions to node '%s' only for some values of parameter '%s'"
+                                        % (node.name, pname))
+                    elif parm.type == "real" and len(conds) == 1:
+                        warning("Contributions to node '%s' only when %s" % (node.name, conds[0]))
+                for (pname, vals) in excls.items():
+                    if len(vals) == 1 and pname not in parms:
+                        warning("No contributions to node '%s' when parameter %s=%d" % (node.name, pname, vals[0]))
+            elif gVerbose:
+                notice("Node '%s' has contributions under conditions %s" % (node.name, conds))
+        elif found_contrib == 3:
+            bprint = bad_branch.node1
+            if bad_branch.node2:
+                bprint += "," + bad_branch.node2
+            warning("Switch branch (%s) with bias-dependent condition" % bprint)
+        elif found_contrib == 0:
+            error("No contributions found for node '%s'" % node.name)
+        gLineNo.pop()
+        gFileName.pop()
+# end of checkInternalNodes
 
 
 def checkMultDeclaration( parm ):
@@ -4596,7 +4832,7 @@ def checkParmsAndVars():
                     if not mult_i or not mult_i.name in var.factors:
                         if mult_i:
                             mname = mult_i.name
-                        elif len(not_upper) == 0: # pragma: no cover
+                        elif len(not_upper) == 0:  # pragma: no cover
                             mname = "MULT_I"
                         else:
                             mname = "mult_i"
@@ -4853,52 +5089,74 @@ def conditionCovered( test, condlist ):
     return retval
 
 
-def mergeConditions( oldlist, new ):
+def mergeConditions( oldlist, new, do_or=False ):
     retlist = []
-    add_new = True
+    add_new = new
     did_merge = False
+    if new in oldlist:
+        # already have this condition
+        return oldlist
+    newparts = splitConditions(new)
+    if len(newparts) == len(oldlist):
+        all_found = True
+        for old in oldlist:
+            not_old = "NOT(" + old + ")"
+            if not_old not in newparts:
+                all_found = False
+                break
+        if all_found:
+            return []
     for old in oldlist:
         if new == "NOT(" + old + ")":
             # A and !(A)
             add_new = False
             retlist = []
             break
-        if new == old:
-            # already have this condition
+        oldparts = splitConditions(old)
+        newparts = splitConditions(new)
+        both = []
+        oldonly = []
+        newonly = []
+        for op in oldparts:
+            if op in newparts:
+                both.append(op)
+            else:
+                oldonly.append(op)
+        for op in newparts:
+            if op in oldparts:
+                if op not in both:  # pragma: no cover
+                    fatal("Programming error in mergeConditions")
+            else:
+                newonly.append(op)
+        replace = False
+        retval = ""
+        if len(newonly) == 0:
+            # dropped some number of old conditions
+            replace = True
+            retval = new
             add_new = False
-            retlist.append(old)
-        else:
-            oldparts = splitConditions(old)
-            newparts = splitConditions(new)
-            both = []
-            oldonly = []
-            newonly = []
-            for op in oldparts:
-                if op in newparts:
-                    both.append(op)
-                else:
-                    oldonly.append(op)
-            for op in newparts:
-                if op in oldparts:
-                    if op not in both:  # pragma: no cover
-                        fatal("Programming error in mergeConditions")
-                else:
-                    newonly.append(op)
-            replace = False
-            retval = ""
-            if len(newonly) == 0:
-                # dropped some number of old conditions
-                replace = True
-                retval = new
-                add_new = False
-            elif len(oldonly) == 0:
-                # new condition is more restrictive
-                add_new = False
-            elif len(oldonly) == 1 and len(newonly) == 1 and \
-                    (oldonly[0] == "NOT(" + newonly[0] + ")" or
-                     newonly[0] == "NOT(" + oldonly[0] + ")"):
-                # A..&&B and A..&&!(B) -> A..
-                # A..&&!(B) and A..&&B -> A..
+        elif len(oldonly) == 0:
+            # new condition is more restrictive
+            add_new = False
+        elif len(oldonly) == 1 and len(newonly) == 1 and \
+                (oldonly[0] == "NOT(" + newonly[0] + ")" or
+                 newonly[0] == "NOT(" + oldonly[0] + ")"):
+            # A..&&B and A..&&!(B) -> A..
+            # A..&&!(B) and A..&&B -> A..
+            for op in both:
+                if retval != "":
+                    retval += "&&"
+                retval += op
+            replace = True
+            add_new = False
+            did_merge = True
+        elif len(newonly) == 1:
+            olds = oldonly[0]
+            for ol in oldonly[1:]:
+                olds += "&&" + ol
+            if newonly[0] == "NOT(" + olds + ")":
+                # A&&B and !(A&&B)
+                # A&&B&&C and !(A&&B&&C)
                 for op in both:
                     if retval != "":
                         retval += "&&"
@@ -4906,26 +5164,28 @@ def mergeConditions( oldlist, new ):
                 replace = True
                 add_new = False
                 did_merge = True
-            elif len(newonly) == 1:
-                olds = oldonly[0]
-                for ol in oldonly[1:]:
-                    olds += "&&" + ol
-                if newonly[0] == "NOT(" + olds + ")":
-                    # A&&B and !(A&&B)
-                    # A&&B&&C and !(A&&B&&C)
-                    for op in both:
-                        if retval != "":
-                            retval += "&&"
-                        retval += op
-                    replace = True
-                    add_new = False
-                    did_merge = True
-            if replace:
-                retlist.append(retval)
-            else:
-                retlist.append(old)
+            elif do_or and oldonly[0] == "NOT(" + newonly[0] + ")":
+                # !A&&B.. and A -> B&&.. and A
+                retval = ""
+                for op in oldonly[1:]:
+                    if retval != "":
+                        retval += "&&"
+                    retval += op
+                for op in both:
+                    if retval != "":
+                        retval += "&&"
+                    retval += op
+                replace = True
+        elif do_or and len(oldparts) == 1 and len(newparts) == 2:
+            if newparts[0] == "NOT(" + oldparts[0] + ")":
+                # A and !A&&B -> new condition is B
+                add_new = newparts[1]
+        if replace:
+            retlist.append(retval)
+        else:
+            retlist.append(old)
     if add_new:
-        retlist.append(new)
+        retlist.append(add_new)
     elif did_merge and len(retlist) > 1:
         retlist = mergeConditions(retlist[:-1], retlist[-1])
     if "" in retlist:
@@ -5525,17 +5785,14 @@ def checkBinning( vname, t_0, t_1, t_2, t_3, t_4, t_5, line ):
         new_pat = [vpfx+vsfx, pfx0+sfx0, fact1+op1, pfx1+sfx1, fact2+op2, pfx2+sfx2, fact3+op3, pfx3+sfx3,
                    fact4+op4, pfx4+sfx4, fact5+op5, pfx5+sfx5]
         if gBinning and (gVerbose or gDebug):
-            if fact3 == "":
-                t_3 = "0"
-            else:
+            t_3 = "0"
+            if fact3:
                 t_3 = pfx3 + "[par]" + sfx3 + " " + op3 + " " + fact3
-            if fact4 == "":
-                t_4 = "0"
-            else:
+            t_4 = "0"
+            if fact4:
                 t_4 = pfx4 + "[par]" + sfx4 + " " + op4 + " " + fact4
-            if fact5 == "":
-                t_5 = "0"
-            else:
+            t_5 = "0"
+            if fact5:
                 t_5 = pfx5 + "[par]" + sfx5 + " " + op5 + " " + fact5
         do_print = False
         if len(gBinningPatterns[0]) == 0:
@@ -5817,7 +6074,7 @@ def parseOther( line ):
                     else:
                         # deps = init_expr.getDependencies(False, False)
                         bad_init = True
-                        if gDebug:
+                        if gDebug:  # pragma: no cover
                             notice("For loop init type %s" % init_expr.type)
                 else:
                     bad_init = True
@@ -6461,7 +6718,7 @@ def parseOther( line ):
                         deps = indirect.getDependencies(False, False)
                         [bias_dep, biases, ddt] = checkDependencies(deps, "Indirect branch contribution depends on",
                                                                     this_c_bd, False, False, True)
-                        if ddt: # pragma: no cover
+                        if ddt:  # pragma: no cover
                             ddt = indirect.ddtCheck()
                             if ddt > 1:
                                 error("Indirect branch contribution is nonlinear in ddt()")
@@ -6645,7 +6902,10 @@ def parseOther( line ):
 
     elif val == ord('`'):
         rest = parser.getRestOfLine()
-        error("Unhandled macro `%s" % rest)
+        if rest.startswith("elseif"):
+            pass # error printed in handleCompilerDirectives
+        else:
+            error("Unhandled macro `%s" % rest)
     elif val == ord('#'):
         rest = parser.getRestOfLine()
         if gCompactModel:
@@ -6748,6 +7008,9 @@ def addBasicDisciplines():
 def handleCompilerDirectives( line ):
     global gMissingConstantsFile
 
+    indent = 0
+    if gPreProcess:
+        indent = getIndent(line)
     line = line.strip()
     if line == "":
         return line
@@ -6755,15 +7018,15 @@ def handleCompilerDirectives( line ):
     # compiler directives
     did_compiler_directive = False
 
-    if line.startswith("`ifdef") or line.startswith("`ifndef"):
-        if line.startswith("`ifdef"):
-            start = 6
-            true_status = "TRUE"
-            false_status = "FALSE"
-        else:
+    if line.startswith("`ifdef") or line.startswith("`ifndef") or line.startswith("`elsif"):
+        if line.startswith("`ifndef"):
             start = 7
             false_status = "TRUE"
             true_status = "FALSE"
+        else:
+            start = 6
+            true_status = "TRUE"
+            false_status = "FALSE"
         if not line[start].isspace():
             error("Missing space after %s" % line[0:start])
         while line[start].isspace():
@@ -6774,20 +7037,34 @@ def handleCompilerDirectives( line ):
         token = line[start:stop]
         if stop < len(line):
             error("Extra characters after `ifdef")
-        if token in gMacros:
-            gMacros[token].used = True
-            gIfDefStatus.append(true_status)
+        if line.startswith("`elsif"):
+            if len(gIfDefStatus) > 0:
+                if gIfDefStatus[-1] == "FALSE":
+                    if token in gMacros:
+                        gMacros[token].used = True
+                        gIfDefStatus[-1] = "TRUE:elsif"
+                    else:
+                        gIfDefStatus[-1] = "FALSE"
+                else: # TRUE, TRUE:elsif, FALSE:elsif means was TRUE at some point
+                    gIfDefStatus[-1] = "FALSE:elsif"
+            else:
+                error("Found `elsif without `ifdef")
         else:
-            gIfDefStatus.append(false_status)
+            if token in gMacros:
+                gMacros[token].used = True
+                gIfDefStatus.append(true_status)
+            else:
+                gIfDefStatus.append(false_status)
         did_compiler_directive = True
+    elif line.startswith("`elseif"):
+        if "elseif" not in gMacros:
+            error("Undefined macro `elseif (was `elsif intended?)")
     elif line.startswith("`else"):
         if len(gIfDefStatus) > 0:
-            if gIfDefStatus[-1] == "TRUE":
-                gIfDefStatus[-1] = "FALSE"
-            elif gIfDefStatus[-1] == "FALSE":
+            if gIfDefStatus[-1] == "FALSE":
                 gIfDefStatus[-1] = "TRUE"
-            else:  # pragma: no cover
-                fatal("Invalid `ifdef status")
+            else: # TRUE, TRUE:elsif, FALSE:elsif means was TRUE at some point
+                gIfDefStatus[-1] = "FALSE"
         else:
             error("Found `else without `ifdef")
         did_compiler_directive = True
@@ -6804,7 +7081,7 @@ def handleCompilerDirectives( line ):
     # check ifdef status
     ifdef_status = True
     for stat in gIfDefStatus:
-        if stat == "FALSE":
+        if stat in ["FALSE", "FALSE:elsif"]:
             ifdef_status = False
 
     if ifdef_status:
@@ -6846,7 +7123,11 @@ def handleCompilerDirectives( line ):
                     found = False
                     if os.path.exists(f_fpn) and os.path.isfile(f_fpn):
                         found = True
-                        parseFile( f_fpn )
+                        lines = parseFile( f_fpn )
+                        if gPreProcess:
+                            line = "//" + line + "\n"
+                            for li in lines:
+                                line = line + li + "\n"
                     else:
                         for fpath in gIncDir:
                             f_fpn = os.path.join(fpath, fname)
@@ -6862,7 +7143,7 @@ def handleCompilerDirectives( line ):
                         if os.path.exists(f_fpn) and os.path.isfile(f_fpn):
                             found = True
                             parseFile( f_fpn )
-                    if not found:
+                    if not found and not gPreProcess:
                         if fname in ["discipline.h", "disciplines.h", "disciplines.vams"]:
                             loc = "https://accellera.org/images/downloads/standards/v-ams/disciplines_2-4.vams"
                             error("File not found: %s\n  Download from %s" % (line, loc))
@@ -6880,7 +7161,7 @@ def handleCompilerDirectives( line ):
                     else:
                         error("Unexpected characters after `include: %s" % rest)
                         rest = ""
-            did_compiler_directive = True
+            did_compiler_directive = not gPreProcess
 
         elif line.startswith("`begin_keywords")      or line.startswith("`end_keywords") \
           or line.startswith("`celldefine")          or line.startswith("`endcelldefine") \
@@ -6894,6 +7175,10 @@ def handleCompilerDirectives( line ):
 
     if did_compiler_directive or not ifdef_status:
         line = ""  # done with this line
+    elif gPreProcess:
+        if indent < 0: # tab
+            indent = gSpcPerInd
+        line = (indent * " ") + line
 
     if line.find("`") >= 0:
         line = expandMacro( line )
@@ -6913,6 +7198,19 @@ def preProcessNaturesAndContribs( lines ):
             contrib = Contribution(parts[0].strip())
             key = len(gContribs)
             gContribs[key] = contrib
+
+
+def preProcessLines( lines ):
+    processed = []
+    for line in lines:
+        gLineNo[-1] += 1
+        line = handleCompilerDirectives(line)
+        if line == "":
+            continue
+        parts = line.split("\n")
+        for part in parts:
+            processed.append(part)
+    return processed
 
 
 def parseLines( lines ):
@@ -6995,7 +7293,7 @@ def parseLines( lines ):
                     error("Macromodels not supported")
                 if len(gScopeList) == 0:
                     gScopeList.append("MODULE::")
-                    parseModuleDecl(part)
+                    parseModuleDecl(part, attribs)
                     gStatementInCurrentBlock = False
                 elif len(gScopeList) == 1:  # pragma: no cover
                     if gScopeList[-1] == "MODULE::":
@@ -7009,6 +7307,7 @@ def parseLines( lines ):
                 verifyEndScope("module")
                 checkPorts()
                 checkParmsAndVars()
+                checkInternalNodes()
 
             # functions
             #
@@ -7064,8 +7363,10 @@ def parseLines( lines ):
             #
             elif part.startswith("parameter") or part.startswith("aliasparam") or part.startswith("localparam") or \
                      part.startswith("inout") or part.startswith("input") or part.startswith("output") or \
-                    (part.startswith("real") and part[4].isspace()) or (part.startswith("integer") and part[7].isspace()) or \
-                    (part.startswith("genvar") and part[6].isspace()) or (part.startswith("string") and part[6].isspace()):
+                    (part.startswith("real") and part[4].isspace()) or \
+                    (part.startswith("integer") and part[7].isspace()) or \
+                    (part.startswith("genvar") and part[6].isspace()) or \
+                    (part.startswith("string") and part[6].isspace()):
                 is_port_dir = False
                 if part.startswith("inout") or part.startswith("input") or part.startswith("output"):
                     is_port_dir = True
@@ -7186,10 +7487,13 @@ def removeComments( line, in_comment ):
     retstr = ""
     in_quote = False
     i = 0
+    last_ch = ""
     while i < len(line):
         if in_comment and not in_quote and i+1 < len(line) and line[i:i+2] == "*/":
             in_comment = False
             i += 2
+            if last_ch == ' ' and line[i] == ' ':
+                i += 1
         if not in_comment and not in_quote and i+1 < len(line) and line[i:i+2] == "/*":
             in_comment = True
             i += 2
@@ -7200,6 +7504,7 @@ def removeComments( line, in_comment ):
             in_quote = not in_quote
         if not in_comment:
             retstr += ch
+            last_ch = ch
         i += 1
     return [retstr, in_comment]
 
@@ -7216,6 +7521,21 @@ def getIndent( line ):
     return num_spaces
 
 
+def checkSingleSpaceAfterParen( line, keywd ):
+    ret = True
+    if line.find(")") >= 0 and line.find(keywd) > 0:
+        ret = False
+        i = 0
+        klen = len(keywd)
+        while i < len(line):
+            if line[i] == ')' and len(line) > i+1+klen:
+                if line[i+1:i+2+klen] == " " + keywd:
+                    ret = True
+                    break
+            i += 1
+    return ret
+
+
 def fixSpaces( line, keywd ):
     ret = ""
     i = 0
@@ -7227,7 +7547,7 @@ def fixSpaces( line, keywd ):
             break
         ret += line[i]
         i += 1
-    ret += ' '
+    ret += ' ' # single space after if
     while i < len(line) and line[i].isspace():
         i += 1
     if line[i] == '(':
@@ -7279,12 +7599,17 @@ def countParentheses( line, num_parens, num_attrib ):
 
 
 def parseFile( filename ):
-    print("Reading %s" % filename)
+    if not gPreProcess:
+        print("Reading %s" % filename)
 
-    check_style = gStyle
-    if filename.find("disciplines.vams") >= 0 or filename.find("discipline.h") >= 0 \
-            or filename.find("constants.vams") >= 0 or filename.find("constants.h") >= 0:
-        # turn off style-checking for standard header files
+    if gStyle:
+        if filename.find("disciplines.vams") >= 0 or filename.find("discipline.h") >= 0 \
+                or filename.find("constants.vams") >= 0 or filename.find("constants.h") >= 0:
+            # turn off style-checking for standard header files
+            check_style = False
+        else:
+            check_style = True
+    else:
         check_style = False
 
     # read the lines from the file
@@ -7300,7 +7625,8 @@ def parseFile( filename ):
         try:
             with open(filename, encoding='windows-1252') as in_file:
                 lines_of_code = in_file.readlines()
-            warning("Non-standard encoding in file %s (windows-1252)" % filename)
+            if not gPreProcess:
+                warning("Non-standard encoding in file %s (windows-1252)" % filename)
         except:
             fatal("Failed to open file: %s" % filename)
     gFileName.append(filename)
@@ -7352,9 +7678,9 @@ def parseFile( filename ):
             if dos_format == -1:
                 dos_format = 1
                 style("MS-DOS file format (\\r\\n)")
-            elif dos_format == 0:
+            elif dos_format == 0 and not gPreProcess:
                 style("Carriage return (\\r or ^M) before newline")
-        elif dos_format == 1:
+        elif dos_format == 1 and not gPreProcess:
             style("Inconsistent line termination (\\n vs \\r\\n)")
         elif dos_format == -1:
             dos_format = 0
@@ -7366,9 +7692,7 @@ def parseFile( filename ):
                 style("Space character at end of line")
         if in_comment:
             if line.find("*/") >= 0:
-                retval = removeComments(line, in_comment)
-                line = retval[0]
-                in_comment = retval[1]
+                [line, in_comment] = removeComments(line, in_comment)
             else:
                 line = ""
             if gFixIndent:
@@ -7382,9 +7706,7 @@ def parseFile( filename ):
             else:
                 paren_continued_lines = 0
             if line.find("//") >= 0 or line.find("/*") >= 0:
-                retval = removeComments(line, in_comment)
-                line = retval[0]
-                in_comment = retval[1]
+                [line, in_comment] = removeComments(line, in_comment)
             if check_style:
                 # getIndent from orig_line to check indent of comments
                 indent = getIndent(orig_line)
@@ -7418,7 +7740,8 @@ def parseFile( filename ):
                                 this_indent = 0
                             if indent_ifdef == 0:
                                 if stripped.find("`ifdef") > 0 or stripped.find("`ifndef") > 0 \
-                                        or stripped.find("`else") > 0 or stripped.find("`endif") > 0:
+                                        or stripped.find("`else") > 0 or stripped.find("`elsif") > 0 \
+                                        or stripped.find("`endif") > 0:
                                     this_indent = 0
                         fixed_line = (this_indent * " ") + stripped + "\n"
                     else:
@@ -7449,24 +7772,39 @@ def parseFile( filename ):
                                 rest = parser.peekRestOfLine().strip()
                                 if rest.startswith("else if"):
                                     rest = rest[7:]
+                                    need_fix = False
                                     if len(rest) < 2 or rest[0] != ' ' or rest[1] != '(':
                                         style("Prefer single space after 'if'")
-                                        if gFixIndent:
-                                            fixed_line = fixSpaces(fixed_line, "else if")
+                                        need_fix = gFixIndent
+                                    if not checkSingleSpaceAfterParen( rest, "begin" ):
+                                        style("Prefer single space between ')' and 'begin'")
+                                        need_fix = gFixIndent
+                                    if need_fix:
+                                        fixed_line = fixSpaces(fixed_line, "else if")
                         elif keywd in ["if", "for", "while", "repeat", "case"]:
                             rest = parser.peekRestOfLine()
+                            need_fix = False
                             if len(rest) < 2 or rest[0] != ' ' or rest[1] != '(':
                                 style("Prefer single space after '%s'" % keywd)
-                                if gFixIndent:
-                                    fixed_line = fixSpaces(fixed_line, keywd)
+                                need_fix = gFixIndent
+                            if not checkSingleSpaceAfterParen( rest, "begin" ):
+                                style("Prefer single space between ')' and 'begin'")
+                                need_fix = gFixIndent
+                            if need_fix:
+                                fixed_line = fixSpaces(fixed_line, keywd)
                         elif keywd == "else":
                             rest = parser.peekRestOfLine().strip()
                             if rest.startswith("if"):
                                 rest = rest[2:]
+                                need_fix = False
                                 if len(rest) < 2 or rest[0] != ' ' or rest[1] != '(':
                                     style("Prefer single space after 'if'")
-                                    if gFixIndent:
-                                        fixed_line = fixSpaces(fixed_line, "if")
+                                    need_fix = gFixIndent
+                                if not checkSingleSpaceAfterParen( rest, "begin" ):
+                                    style("Prefer single space between ')' and 'begin'")
+                                    need_fix = gFixIndent
+                                if need_fix:
+                                    fixed_line = fixSpaces(fixed_line, "if")
                     elif val == ord('@'):
                         keywd = "@"
                     this_indent = required_indent
@@ -7630,7 +7968,7 @@ def parseFile( filename ):
                                 if indent_ifdef == 0:
                                     this_indent = 0
                                 fixed_line = (this_indent * " ") + fixed_line.strip() + "\n"
-                            elif token == "else":
+                            elif token in ["else", "elsif"]:
                                 if indent_inside_ifdef == -1:
                                     # only comments in the `ifdef block
                                     optional_indent += gSpcPerInd
@@ -7842,7 +8180,10 @@ def parseFile( filename ):
     gLineNo[-1] = 0
     preProcessNaturesAndContribs(lines_to_parse)
     gLineNo[-1] = 0
-    parseLines(lines_to_parse)
+    if gPreProcess:
+        lines_of_code = preProcessLines(lines_to_parse)
+    else:
+        parseLines(lines_to_parse)
 
     if len(gIfDefStatus) > initial_ifdef:
         error("Missing `endif")
@@ -7854,6 +8195,8 @@ def parseFile( filename ):
     gLineNo.pop()
     if len(gFileName) == 0 and len(gScopeList) > 0:
         error("Missing 'endmodule'")
+
+    return lines_of_code
 # end of parseFile
 
 
@@ -7904,9 +8247,11 @@ argpar.add_argument('-D', '--define',         help='define token', action='appen
 argpar.add_argument('-f', '--fix_indent',     help='fix indentation problems', action='store_true')
 argpar.add_argument('-i', '--info',           help='print detailed usage information', action=InfoAction, nargs=0)
 argpar.add_argument('-I', '--inc_dir',        help='add search path for include', action='append', default=[])
-argpar.add_argument(      '--max_num',        help='maximum number of each error/warning message type', type=int, default=5)
+argpar.add_argument(      '--max_num',        help='maximum number of each error/warning message type', type=int, \
+                                              default=5)
 argpar.add_argument('-n', '--no_style',       help='turn off style checking', action='store_false')
 argpar.add_argument(      '--not_compact',    help='not a compact model', action='store_false')
+argpar.add_argument(      '--preprocess',     help='run preprocessor only', action='store_true')
 argpar.add_argument(      '--print_defaults', help='print default values for all parameters', action='store_true')
 argpar.add_argument('-s', '--indent_spaces',  help='number of spaces to indent', type=int, default=4)
 argpar.add_argument(      '--superfluous',    help='report superfluous assignments', action='store_true')
@@ -7920,6 +8265,7 @@ gBinning      = cmdargs.binning
 gFixIndent    = cmdargs.fix_indent
 gCompactModel = cmdargs.not_compact
 gPrDefVals    = cmdargs.print_defaults
+gPreProcess   = cmdargs.preprocess
 gSuperfluous  = cmdargs.superfluous
 if cmdargs.all:
     gMaxNum = 0
@@ -7933,5 +8279,12 @@ if gFixIndent and not gStyle:
 if gVerbose:
     print("VAMPyRE version %s" % gVersionNumber)
 initializeModule()
-parseFile(cmdargs.main_file)
-printModuleSummary()
+if gPreProcess:
+    gFixIndent = False
+    gStyle = False
+    output = parseFile(cmdargs.main_file)
+    for ln in output:
+        print(ln)
+else:
+    parseFile(cmdargs.main_file)
+    printModuleSummary()
