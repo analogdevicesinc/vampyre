@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """ VAMPyRE
     Verilog-A Model Pythonic Rule Enforcer
-    version 1.9.3, 01-Dec-2023
+    version 1.9.4, 17-Apr-2024
 
     intended for checking for issues like:
      1) hidden state (variables used before assigned)
@@ -25,8 +25,9 @@
     13) various problems with binning equations and units
     14) nonlinear ddt() expressions and C(V)*ddt(V) formulations
     15) superfluous assignments
+    16) order-of-operation problems with macro expansions
 
-    Copyright (c) 2023 Analog Devices, Inc.
+    Copyright (c) 2024 Analog Devices, Inc.
 
     Licensed under Educational Community License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License. You may
@@ -51,7 +52,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.9.3"
+gVersionNumber = "1.9.4"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -172,6 +173,13 @@ gVAMScompdir = [
 # hierarchical system parameters from VAMS LRM Section 6.3.6
 gVAMShiersysparm = ["$xposition", "$yposition", "$angle", "$hflip", "$vflip"]
 
+# operator precedence
+gOperatorPrecedence = {"u-": 12, "!": 12, "**": 11, "*": 10, "/": 10, "%": 10,
+                       "+": 9, "-": 9, "<<": 8, ">>": 8, "<<<": 8, ">>>": 8,
+                       "<": 7, "<=": 7, ">": 7, ">=": 7,
+                       "==": 6, "!=": 6, "===": 6, "!==": 6,
+                       "&": 5, "|": 3, "&&": 2, "||": 1}
+
 # math functions and number of arguments
 gMathFunctions = {"abs": 1, "limexp": 1, "log": 1, "$log10": 1, "min": 2, "max": 2}
 # math functions with both name and $name form
@@ -190,10 +198,10 @@ for fn in ["idtmod", "absdelay", "analysis", "transition", "slew", "last_crossin
     gMathFunctions[fn] = 99
 
 # units for multiplicity checking
-gUnitsMultiply = ["A", "Amp", "Amps", "F", "Farads", "C", "coul", "Coulomb", "Coulombs",
-                  "W", "Watt", "Watts", "A/V", "S", "mho", "A*V", "A*V/K", "A/K", "C/K",
+gUnitsMultiply = ["A", "amp", "amps", "F", "farad", "farads", "C", "coul", "coulomb", "coulombs",
+                  "W", "watt", "watts", "A/V", "S", "mho", "A*V", "A*V/K", "A/K", "C/K",
                   "J/K", "s*W/K", "A/V^2", "A^2/Hz"]
-gUnitsDivide   = ["Ohm", "Ohms", "V/A", "K/W", "V^2/Hz"]
+gUnitsDivide   = ["ohm", "ohms", "Ohm", "V/A", "K/W", "V^2/Hz"]
 
 # MULT_* factors
 gMultFactors = ["mult_i", "mult_q", "mult_fn", "MULT_I", "MULT_Q", "MULT_FN"]
@@ -278,6 +286,7 @@ class Variable:
         self.prev_assign = []         # details about previous assignment
         self.non_zero_assign = False  # true if assigned a non-zero value
         self.conditions = []          # conditions when assigned
+        self.cond_deps = []           # dependencies of assignment conditions
         self.accesses = []            # details about assignments and uses
         self.used = False             # whether used
         self.bias_dep = 0             # bias-dependent: 0=no, 1=from if cond, 2=yes, 3=deriv error, 4=ddx
@@ -286,6 +295,7 @@ class Variable:
         self.factors = []             # factors (for MULT_* checks)
         self.ddt_use = 0              # involves ddt: 0=no, 1=linear, 2=nonlinear
         self.func_name_arg = ["", 0]  # tracing whether function output arg is used
+        self.integer_vals = []        # bias-independent integer values, if any
 
 
 class Access:
@@ -372,8 +382,9 @@ class Expression:
         self.number = 0
         self.is_int = False    # is the expression an integer?
         self.args = []
+        self.parens = False    # whether expression was in (parentheses)
 
-    def getDependencies(self, assign_context, branch_contrib):
+    def getDependencies(self, assign_context, branch_contrib, do_warn):
         deps = []
         if self.type == "NAME":
             deps = [self.e1]
@@ -382,10 +393,10 @@ class Expression:
         elif self.type == "ARRAY":
             deps = []
             for arg in self.args:
-                deps += arg.getDependencies(assign_context, branch_contrib)
+                deps += arg.getDependencies(assign_context, branch_contrib, do_warn)
         elif self.type == "FUNCCALL":
             if self.e1 in gAccessFuncs:
-                if len(gAnalogBlock) > 0 and gAnalogBlock[-1] == "initial":
+                if do_warn and gAnalogBlock and gAnalogBlock[-1] == "initial":
                     error("Branch access in analog initial block")
                 nargs = len(self.args)
                 if nargs > 0:
@@ -414,14 +425,15 @@ class Expression:
                         elif fname in gNatures and self.e1 == gNatures[fname].access:
                             #deps.append("flow")
                             pass
-                        else:
+                        elif do_warn:
                             error("Incorrect access function '%s' for %s '%s'"
                                   % (self.e1, dname, nname1))
-                    elif dname == "" and not branch_contrib:
+                    elif dname == "" and do_warn and not branch_contrib:
                         # if branch_contrib, error was reported already
                         error("Cannot determine discipline of '%s'" % nname1)
                     if nargs > 2 or (nargs > 1 and (nname1 in gBranches or self.args[1].e1 in gBranches)):
-                        error("Invalid potential or flow access")
+                        if do_warn:
+                            error("Invalid potential or flow access")
                     elif nargs == 2:
                         nname2 = self.args[1].e1
                         dname2 = ""
@@ -431,7 +443,7 @@ class Expression:
                         elif nname2 in gNodenames:
                             dname2 = gNodenames[nname2].discipline
                             gNodenames[nname2].used = True
-                        if dname2 != "" and dname2 != dname and not branch_contrib:
+                        if dname2 != "" and dname2 != dname and do_warn and not branch_contrib:
                             # if branch_contrib, error was reported already
                             error("Nodes '%s' and '%s' belong to different disciplines"
                                   % (nname1, nname2))
@@ -447,7 +459,7 @@ class Expression:
                         if nname2 != "":
                             dep = self.e1 + "(" + nname2 + ")"
                             deps.append(dep)
-                elif nargs == 0 and not branch_contrib:
+                elif nargs == 0 and do_warn and not branch_contrib:
                     # if branch_contrib, error was reported already
                     error("Missing node/branch name in potential or flow access")
             elif self.e1 in ["$port_connected", "$param_given"]:
@@ -456,19 +468,19 @@ class Expression:
                     if self.e1 == "$port_connected":
                         if nname in gPortnames:
                             gPortnames[nname].used = True
-                        else:
+                        elif do_warn:
                             error("Invalid argument '%s' to %s, must be a port" % (nname, self.e1))
                     elif self.e1 == "$param_given":
                         if nname in gParameters:
                             gParameters[nname].used += 1
-                        else:
+                        elif do_warn:
                             error("Invalid argument '%s' to %s, must be a parameter" % (nname, self.e1))
-                else:
+                elif do_warn:
                     error("Incorrect number of arguments to %s" % self.e1)
             elif self.e1 == "limexp":
                 if len(self.args) == 1:
                     arg = self.args[0]
-                    deps = arg.getDependencies(assign_context, branch_contrib)
+                    deps = arg.getDependencies(assign_context, branch_contrib, do_warn)
                     [bias_dep, biases, ddt] = checkDependencies(deps, "Call to function '%s' depends on"
                                                                 % self.e1, 0, False, True, False)
                     if not bias_dep:
@@ -477,11 +489,12 @@ class Expression:
                 # else: warning issued elsewhere
             elif self.e1 == "$limit":
                 if len(self.args) == 0:
-                    error("Require at least one argument to %s" % self.e1)
+                    if do_warn:
+                        error("Require at least one argument to %s" % self.e1)
                 else:
                     access = self.args[0]
-                    deps += access.getDependencies(assign_context, branch_contrib)
-                    if access.type != "FUNCCALL" or access.e1 not in gAccessFuncs:
+                    deps += access.getDependencies(assign_context, branch_contrib, do_warn)
+                    if access.type != "FUNCCALL" or access.e1 not in gAccessFuncs and do_warn:
                         error("First argument to $limit must be a potential or flow access function")
                 if len(self.args) >= 2:
                     limfn = self.args[1]
@@ -490,17 +503,17 @@ class Expression:
                         fname = limfn.e1
                         if fname in gUserFunctions:
                             gUserFunctions[fname].used = True
-                        else:
+                        elif do_warn:
                             error("Unknown identifier '%s' specified as limiting function" % fname)
                     elif limfn.type == "STRING":
                         # string: simulator function
                         fname = limfn.e1
-                        if fname not in ["\"pnjlim\"", "\"fetlim\""]:
+                        if do_warn and fname not in ["\"pnjlim\"", "\"fetlim\""]:
                             notice("Non-standard limiting function %s" % fname)
-                    else:
+                    elif do_warn:
                         warning("Second argument to $limit should be a string or identifier")
                     for arg in self.args[2:]:
-                        argdeps = arg.getDependencies(assign_context, branch_contrib)
+                        argdeps = arg.getDependencies(assign_context, branch_contrib, do_warn)
                         [bias_dep, biases, ddt] = checkDependencies(argdeps,
                                                                     "Call to function '%s' depends on"
                                                                     % self.e1, 0, False, True, False)
@@ -508,7 +521,7 @@ class Expression:
             elif self.e1 == "ddx":
                 if len(self.args) == 2:
                     arg = self.args[0]
-                    argdeps = arg.getDependencies(assign_context, branch_contrib)
+                    argdeps = arg.getDependencies(assign_context, branch_contrib, do_warn)
                     deps = ["ddx"]
                     deps += argdeps
                     acc = self.args[1]
@@ -517,16 +530,14 @@ class Expression:
                         accstr = acc.asString()
                         [bias_dep, biases, ddt] = checkDependencies(argdeps, "Call to ddx() depends on",
                                                                     0, False, True, False)
-                        if ddt:
+                        if ddt and do_warn:
                             error("Call to ddx() where argument %s involves ddt()" % arg.asString())
-                        if accstr not in biases:
+                        if accstr not in biases and do_warn:
                             warning("Call to ddx(), but %s does not depend on %s"
                                     % (arg.asString(), acc.asString()))
                             if gDebug:
                                 print("    Depends on: %s" % biases)
                 # else error printed during parsing
-            elif assign_context and self.e1 in ["white_noise", "flicker_noise", "noise_table", "noise_table_log"]:
-                warning("Small-signal noise source '%s' in assignment" % self.e1)
             elif branch_contrib and self.e1 in ["white_noise", "flicker_noise", "noise_table", "noise_table_log",
                                                 "laplace_zp", "laplace_zd", "laplace_np", "laplace_nd",
                                                 "zi_zp", "zi_zd", "zi_np", "zi_nd"]:
@@ -536,6 +547,8 @@ class Expression:
                 out_arg_pos = []
                 if (assign_context or branch_contrib) and self.e1 == "ddt":
                     deps = ["ddt"]
+                if assign_context and self.e1 in ["white_noise", "flicker_noise", "noise_table", "noise_table_log"]:
+                    warning("Small-signal noise source '%s' in assignment" % self.e1)
                 if self.e1 in gUserFunctions:
                     # find positions of output arguments
                     funcdef = gUserFunctions[self.e1]
@@ -547,13 +560,13 @@ class Expression:
                 for i in range(len(self.args)):
                     arg = self.args[i]
                     if i in out_arg_pos:
-                        if not assign_context:
+                        if do_warn and not assign_context:
                             error("Function '%s' with output arguments called in unexpected context" % self.e1)
                     elif arg.type == "NOTHING":
                         pass  # null argument
                     else:
-                        deps += arg.getDependencies(assign_context, branch_contrib)
-                if assign_context and len(out_arg_pos) > 0:
+                        deps += arg.getDependencies(assign_context, branch_contrib, do_warn)
+                if assign_context and out_arg_pos:
                     [bias_dep, biases, ddt] = checkDependencies(deps, "Call to function '%s' depends on"
                                                                       % self.e1, 0, False, False, True)
                     for i in range(len(self.args)):
@@ -562,20 +575,20 @@ class Expression:
                             markVariableAsSet(arg.e1, None, [], bias_dep, Expression("NOTHING"),
                                               biases, 0, False, True, self.e1, i)
 
-        elif self.type in ["!", "~"]:
-            deps = self.e1.getDependencies(assign_context, branch_contrib)
+        elif self.type in ["!", "~", "NOT"]:
+            deps = self.e1.getDependencies(assign_context, branch_contrib, do_warn)
         elif self.type in ["+", "-"]:
-            dep1 = self.e1.getDependencies(assign_context, branch_contrib)
+            dep1 = self.e1.getDependencies(assign_context, branch_contrib, do_warn)
             if self.e2:
-                dep2 = self.e2.getDependencies(assign_context, branch_contrib)
+                dep2 = self.e2.getDependencies(assign_context, branch_contrib, do_warn)
             else:  # unary +/-
                 dep2 = []
             deps = dep1 + dep2
         elif self.type in ["*", "/", "%", "**",
                            "==", "!=", "<", ">", "<=", ">=",
                            "&&", "||", "&", "|", "^"]:
-            dep1 = self.e1.getDependencies(assign_context, branch_contrib)
-            dep2 = self.e2.getDependencies(assign_context, branch_contrib)
+            dep1 = self.e1.getDependencies(assign_context, branch_contrib, do_warn)
+            dep2 = self.e2.getDependencies(assign_context, branch_contrib, do_warn)
             deps = dep1 + dep2
             if self.type == "*" and "ddt" in deps:
                 # check for C(V) * ddt(V)
@@ -594,17 +607,18 @@ class Expression:
                             bad_biases.append(bias)
                     if bad_biases:
                         bias = simplifyBiases(bad_biases)
-                        error("Non-charge-conserving f(%s) * ddt(%s)" % (bias, bias))
+                        if do_warn:
+                            error("Non-charge-conserving f(%s) * ddt(%s)" % (bias, bias))
         elif self.type in ["<<", ">>", "<<<", ">>>", "===", "!==",
                            "^~", "~^", "~&", "~|"]:
             # not expected in Verilog-A
-            dep1 = self.e1.getDependencies(assign_context, branch_contrib)
-            dep2 = self.e2.getDependencies(assign_context, branch_contrib)
+            dep1 = self.e1.getDependencies(assign_context, branch_contrib, do_warn)
+            dep2 = self.e2.getDependencies(assign_context, branch_contrib, do_warn)
             deps = dep1 + dep2
         elif self.type in ["?:"]:
-            dep1 = self.e1.getDependencies(assign_context, branch_contrib)
-            dep2 = self.e2.getDependencies(assign_context, branch_contrib)
-            dep3 = self.e3.getDependencies(assign_context, branch_contrib)
+            dep1 = self.e1.getDependencies(assign_context, branch_contrib, do_warn)
+            dep2 = self.e2.getDependencies(assign_context, branch_contrib, do_warn)
+            dep3 = self.e3.getDependencies(assign_context, branch_contrib, do_warn)
             deps = dep1 + dep2 + dep3
         else:  # pragma: no cover
             fatal("Unhandled expression type '%s' in getDependencies" % self.type)
@@ -664,7 +678,7 @@ class Expression:
                 else:
                     ret = ddt3
             else:
-                error("ddt() dependence in condition for ?: operator")
+                error("ddt() dependence in condition for '?:' operator")
         elif self.type in ["!", "~"]:
             error("ddt() dependence in operand for '%s' operator" % self.type)
         elif self.type in ["==", "!=", "<", ">", "<=", ">=",
@@ -756,7 +770,7 @@ class Parser:
     def __init__(self, line):
         self.line = line
         self.chpt = 0
-        self.end  = len(line)
+        self.end = len(line)
         self.token = 0
         self.number = 0
         self.ternary_cond = Expression("NOTHING")
@@ -1098,23 +1112,23 @@ class Parser:
 
     # expression parsing - watch for order of operations
 
-    def parseArgList(self, is_cond=False, allow_repl=False):
+    def parseArgList(self, do_warn, is_cond=False, allow_repl=False):
         args = []
-        expr = self.getExpression(is_cond)
+        expr = self.getExpression(is_cond, do_warn)
         if expr.type == "NOTHING" and self.peekChar() == ')':
             return []
         self.eatSpace()
         ch = self.peekChar()
         if ch == '{' and allow_repl:
             self.getChar()
-            sub_args = self.parseArgList()
+            sub_args = self.parseArgList(do_warn)
             self.eatSpace()
             if self.peekChar() == '}':
                 self.getChar()
                 self.eatSpace()
-            else:
+            elif do_warn:
                 error("Missing '}'")
-            if not expr.is_int:
+            if do_warn and not expr.is_int:
                 error("Non-integer multiplier '%s' in replication" % expr.asString())
             repl = 1
             if expr.type == "NUMBER":
@@ -1124,22 +1138,22 @@ class Parser:
                 defv = gParameters[expr.e1].defv
                 if defv.type == "NUMBER":
                     repl = int(defv.number)
-                else:
+                elif do_warn:
                     warning("Cannot determine value of multiplier '%s' in replication" % expr.e1)
-            else:
+            elif do_warn:
                 error("Invalid multiplier '%s' in replication" % expr.asString())
             args = repl * sub_args
         else:
             args.append(expr)
             while ch == ',':
                 self.getChar()
-                expr = self.getExpression()
+                expr = self.getExpression(is_cond, do_warn)
                 args.append(expr)
                 self.eatSpace()
                 ch = self.peekChar()
         return args
 
-    def parsePrimary(self, is_cond):
+    def parsePrimary(self, is_cond, do_warn):
         val = self.lex()
         if self.isIdentifier():
             expr = Expression("NAME")
@@ -1150,7 +1164,7 @@ class Parser:
                 val = self.lex()
                 if self.isIdentifier():
                     expr.e1 += self.getString()
-                else:  # pragma: no cover
+                elif do_warn:  # pragma: no cover
                     error("Invalid hierarchical identifier %s" % expr.e1)
         elif self.isNumber():
             expr = Expression("NUMBER")
@@ -1161,42 +1175,43 @@ class Parser:
             expr = Expression("STRING")
             expr.e1 = self.getString()
         elif val == ord('('):
-            expr = self.getExpression(is_cond)
+            expr = self.getExpression(is_cond, do_warn)
             self.eatSpace()
             if self.parse_units and self.peekChar().isalpha():
                 expr1 = expr
-                expr2 = self.getExpression()
+                expr2 = self.getExpression(is_cond, do_warn)
                 expr = Expression("*")
                 expr.e1 = expr1
                 expr.e2 = expr2
                 self.eatSpace()
             if self.peekChar() == ')':
+                expr.parens = True
                 self.getChar()
                 self.eatSpace()
-            elif not self.parse_units:
+            elif do_warn and not self.parse_units:
                 error("Missing ')'")
         elif val == ord('\''):
             if self.peekChar() == '{':
                 self.getChar()
                 expr = Expression("ARRAY")
-                expr.args = self.parseArgList(is_cond, True)
+                expr.args = self.parseArgList(do_warn, is_cond, True)
                 self.eatSpace()
                 if self.peekChar() == '}':
                     self.getChar()
                     self.eatSpace()
-                elif not self.parse_units:
+                elif do_warn and not self.parse_units:
                     error("Missing '}'")
             else:  # pragma: no cover
                 self.ungetChar(chr(val))
                 expr = Expression("NOTHING")
         elif val == ord('{'):
             expr = Expression("ARRAY")
-            expr.args = self.parseArgList(is_cond, True)
+            expr.args = self.parseArgList(do_warn, is_cond, True)
             self.eatSpace()
             if self.peekChar() == '}':
                 self.getChar()
                 self.eatSpace()
-            elif not self.parse_units:
+            elif do_warn and not self.parse_units:
                 error("Missing '}'")
         elif val == ord('`'):
             # undefined macro
@@ -1211,8 +1226,8 @@ class Parser:
         self.eatSpace()
         return expr
 
-    def parsePostfix(self, is_cond):
-        expr = self.parsePrimary(is_cond)
+    def parsePostfix(self, is_cond, do_warn):
+        expr = self.parsePrimary(is_cond, do_warn)
         if expr.type == "NAME":
             ch = self.peekChar()
             if ch == '(':
@@ -1229,9 +1244,9 @@ class Parser:
                         ch = self.peekChar()
                     if ch == '>':
                         self.getChar()
-                        if pname not in gPortnames:
+                        if do_warn and pname not in gPortnames:
                             error("%s(<%s>) is not a valid port flow access" % (fname, pname))
-                    else:
+                    elif do_warn:
                         error("Missing '>' in port flow access")
                     arg = Expression("PORT_FLOW")
                     arg.e1 = pname
@@ -1239,125 +1254,134 @@ class Parser:
                 elif ch == ')':
                     args = []
                 else:
-                    args = self.parseArgList(is_cond)
+                    args = self.parseArgList(do_warn, is_cond)
                 expr = Expression("FUNCCALL")
                 expr.e1 = fname
                 expr.args = args
-                if fname in gMathFunctions:
-                    nargs = gMathFunctions[fname]
-                    if nargs == 99:
-                        if gCompactModel:
-                            warning("Function '%s' should not be used in a compact model" % fname)
-                    elif nargs != len(args):
-                        error("Incorrect number of arguments (%d) for function %s (expect %d)"
-                              % (len(args), fname, nargs))
-                    if fname == "log":
-                        warning("Found base-10 log(); use ln() for natural log")
-                    check_arg = False
-                    allow_zero = False
-                    if fname in ["ln", "$ln", "log", "$log10", "sqrt", "$sqrt"] and len(args) == 1:
-                        check_arg = True
-                    elif fname in ["pow", "$pow"] and len(args) == 2:
-                        expon = args[1]
-                        if expon.type == "NUMBER" and expon.number < 0:
+                if do_warn:
+                    if fname in gMathFunctions:
+                        nargs = gMathFunctions[fname]
+                        if nargs == 99:
+                            if gCompactModel:
+                                warning("Function '%s' should not be used in a compact model" % fname)
+                        elif nargs != len(args):
+                            error("Incorrect number of arguments (%d) for function %s (expect %d)"
+                                  % (len(args), fname, nargs))
+                        if fname == "log":
+                            warning("Found base-10 log(); use ln() for natural log")
+                        check_arg = False
+                        allow_zero = False
+                        if fname in ["ln", "$ln", "log", "$log10", "sqrt", "$sqrt"] and len(args) == 1:
                             check_arg = True
-                        elif expon.type == "NUMBER" and expon.number > 0 and not expon.is_int:
-                            check_arg = True
-                            allow_zero = True
-                    if check_arg:
-                        arg = args[0]
-                        if fname in ["sqrt", "$sqrt"]:
-                            allow_zero = True
-                        zeros = getParamZeros(arg, True)
-                        if len(zeros) > 0:
-                            for pname in zeros:
-                                arg_str = ""
-                                if pname[0] == '-':
-                                    pname = pname[1:]
-                                    if not checkParamRangeNeg(pname, allow_zero):
-                                        if not checkConditionsRequireNegative(pname, allow_zero, self.ternary_cond):
-                                            arg_str = arg.asString()
-                                else:
-                                    if not checkParamRangePos(pname, allow_zero):
-                                        if not checkConditionsRequirePositive(pname, allow_zero, self.ternary_cond):
-                                            arg_str = arg.asString()
-                                if arg_str != "":
-                                    if allow_zero:
-                                        bad_val = "negative"
+                            if fname in ["sqrt", "$sqrt"]:
+                                allow_zero = True
+                        elif fname in ["pow", "$pow"] and len(args) == 2:
+                            expon = args[1]
+                            if expon.type == "NUMBER" and expon.number < 0:
+                                check_arg = True
+                            elif expon.type == "NUMBER" and expon.number > 0 and not expon.is_int:
+                                check_arg = True
+                                allow_zero = True
+                        if check_arg:
+                            arg = args[0]
+                            zeros = getParamZeros(arg, True)
+                            if zeros:
+                                plist = []
+                                for pname in zeros:
+                                    if pname in plist:
+                                        if allow_zero:
+                                            plist.remove(pname)
                                     else:
-                                        bad_val = "non-positive"
-                                    if fname in ["pow", "$pow"]:
-                                        warning("Range of parameter '%s' allows %s argument for function '%s(arg,%g)'"
-                                                % (pname, bad_val, fname, args[1].number))
+                                        plist.append(pname)
+                                zeros = plist
+                                for pname in zeros:
+                                    arg_str = ""
+                                    if pname[0] == '-':
+                                        pname = pname[1:]
+                                        if not checkParamRangeNeg(pname, allow_zero):
+                                            if not checkConditionsRequireNegative(pname, allow_zero, self.ternary_cond):
+                                                arg_str = arg.asString()
                                     else:
-                                        if pname == arg_str:
-                                            warning("Parameter range allows %s argument for function '%s(%s)'"
-                                                    % (bad_val, fname, pname))
+                                        if not checkParamRangePos(pname, allow_zero):
+                                            if not checkConditionsRequirePositive(pname, allow_zero, self.ternary_cond):
+                                                arg_str = arg.asString()
+                                    if arg_str != "":
+                                        if allow_zero:
+                                            bad_val = "negative"
                                         else:
-                                            warning("Range of parameter '%s' allows %s argument for function '%s()'"
-                                                    % (pname, bad_val, fname))
-                        elif arg.type == "NUMBER":
-                            if arg.number < 0:
-                                warning("Negative argument to function '%s(%s)'" % (fname, arg.asString()))
-                            elif arg.number == 0 and not allow_zero:
-                                warning("Zero argument to function '%s(%s)'" % (fname, arg.asString()))
-                        elif checkFuncArgNoConditions(arg):
-                            warning("Parameter range(s) allow negative argument to function '%s(%s)'"
-                                    % (fname, arg.asString()))
-                elif fname in gUserFunctions:
-                    if gUserFunctions[fname].type == "integer":
-                        expr.is_int = True
-                elif fname == "white_noise":
-                    if len(args) == 1:
-                        error("Missing name for white_noise()")
-                    elif len(args) > 2 or len(args) == 0:
-                        error("Incorrect number of arguments (%d) for function %s (expect 1 or 2)"
-                              % (len(args), fname))
-                    if "white_noise" not in gNoiseTypes:
-                        gNoiseTypes.append("white_noise")
-                elif fname == "flicker_noise":
-                    if len(args) == 2:
-                        error("Missing name for flicker_noise()")
-                    elif len(args) > 3 or len(args) < 2:
-                        error("Incorrect number of arguments (%d) for function %s (expect 2 or 3)"
-                              % (len(args), fname))
-                    if "flicker_noise" not in gNoiseTypes:
-                        gNoiseTypes.append("flicker_noise")
-                elif fname == "ddt":
-                    if len(args) != 1:
-                        error("Incorrect number of arguments (%d) for function %s (expect 1)"
-                              % (len(args), fname))
-                elif fname == "ddx":
-                    if len(args) == 2:
-                        acc = args[1]
-                        if acc.type != "FUNCCALL" or acc.e1 not in gAccessFuncs:
-                            error("Second argument to %s must be a branch probe" % fname)
-                        elif len(acc.args) > 1:
-                            error("Second argument to %s must be a node potential or branch flow" % fname)
-                    else:
-                        error("Incorrect number of arguments (%d) for function %s (expect 2)"
-                              % (len(args), fname))
-                elif fname == "$simparam":
-                    if len(args) == 1 or len(args) == 2:
-                        name = args[0]
-                        if name.type != "STRING":
-                            error("First argument to %s must be a string" % fname)
-                        elif name.e1 == "\"gmin\"":
-                            if len(args) == 1:
-                                warning("$simparam(\"gmin\") call should provide default value 0 for second argument")
-                            else:
-                                defv = args[1]
-                                if defv.type != "NUMBER" or defv.number != 0:
-                                    warning("$simparam(\"gmin\", %s) should use 0 for default value" % defv.asString())
-                    else:
-                        error("Incorrect number of arguments (%d) for function %s (expect 1 or 2)"
-                              % (len(args), fname))
+                                            bad_val = "non-positive"
+                                        if fname in ["pow", "$pow"]:
+                                            warning("Range of parameter '%s' allows %s argument for function '%s(arg,%g)'"
+                                                    % (pname, bad_val, fname, args[1].number))
+                                        else:
+                                            if pname == arg_str:
+                                                warning("Parameter range allows %s argument for function '%s(%s)'"
+                                                        % (bad_val, fname, pname))
+                                            else:
+                                                warning("Range of parameter '%s' allows %s argument for function '%s()'"
+                                                        % (pname, bad_val, fname))
+                            elif arg.type == "NUMBER":
+                                if arg.number < 0:
+                                    warning("Negative argument to function '%s(%s)'" % (fname, arg.asString()))
+                                elif arg.number == 0 and not allow_zero:
+                                    warning("Zero argument to function '%s(%s)'" % (fname, arg.asString()))
+                            elif checkFuncArgNoConditions(arg):
+                                warning("Parameter range(s) allow negative argument to function '%s(%s)'"
+                                        % (fname, arg.asString()))
+                    elif fname in gUserFunctions:
+                        if gUserFunctions[fname].type == "integer":
+                            expr.is_int = True
+                    elif fname == "white_noise":
+                        if len(args) == 1:
+                            error("Missing name for white_noise()")
+                        elif len(args) > 2 or len(args) == 0:
+                            error("Incorrect number of arguments (%d) for function %s (expect 1 or 2)"
+                                  % (len(args), fname))
+                        if "white_noise" not in gNoiseTypes:
+                            gNoiseTypes.append("white_noise")
+                    elif fname == "flicker_noise":
+                        if len(args) == 2:
+                            error("Missing name for flicker_noise()")
+                        elif len(args) > 3 or len(args) < 2:
+                            error("Incorrect number of arguments (%d) for function %s (expect 2 or 3)"
+                                  % (len(args), fname))
+                        if "flicker_noise" not in gNoiseTypes:
+                            gNoiseTypes.append("flicker_noise")
+                    elif fname == "ddt":
+                        if len(args) != 1:
+                            error("Incorrect number of arguments (%d) for function %s (expect 1)"
+                                  % (len(args), fname))
+                    elif fname == "ddx":
+                        if len(args) == 2:
+                            acc = args[1]
+                            if acc.type != "FUNCCALL" or acc.e1 not in gAccessFuncs:
+                                error("Second argument to %s must be a branch probe" % fname)
+                            elif len(acc.args) > 1:
+                                error("Second argument to %s must be a node potential or branch flow" % fname)
+                        else:
+                            error("Incorrect number of arguments (%d) for function %s (expect 2)"
+                                  % (len(args), fname))
+                    elif fname == "$simparam":
+                        if len(args) == 1 or len(args) == 2:
+                            name = args[0]
+                            if name.type != "STRING":
+                                error("First argument to %s must be a string" % fname)
+                            elif name.e1 == "\"gmin\"":
+                                if len(args) == 1:
+                                    warning("$simparam(\"gmin\") call should provide default value 0 for second argument")
+                                else:
+                                    defv = args[1]
+                                    if defv.type != "NUMBER" or defv.number != 0:
+                                        warning("$simparam(\"gmin\", %s) should use 0 for default value" % defv.asString())
+                        else:
+                            error("Incorrect number of arguments (%d) for function %s (expect 1 or 2)"
+                                  % (len(args), fname))
 
                 self.eatSpace()
                 if self.peekChar() == ')':
                     self.getChar()
                     self.eatSpace()
-                else:
+                elif do_warn:
                     error("Missing ')' in function call")
             elif ch == '[':
                 # bus select
@@ -1380,64 +1404,65 @@ class Parser:
                         expr.is_int = True
         return expr
 
-    def parsePrefix(self, is_cond):
+    def parsePrefix(self, is_cond, do_warn):
         oper = self.peekOper()
         if oper == "-":               # Unary minus
             oper = self.getOper()
-            do_warn = ""
+            warn = ""
             if self.peekOper() == "-":
-                do_warn = "-"
+                warn = "-"
             elif self.peekOper() == "+":
-                do_warn = "-+"
-            arg = self.parsePrefix(is_cond)
+                warn = "-+"
+            arg = self.parsePrefix(is_cond, do_warn)
             if arg.type == "NUMBER":
                 expr = Expression("NUMBER")
                 expr.number = -arg.number
                 expr.is_int = arg.is_int
-                if isinstance(arg.e1, str) and do_warn == "":
+                if isinstance(arg.e1, str) and warn == "":
                     expr.e1 = oper + arg.e1
             else:
                 expr = Expression(oper)
                 expr.e1 = arg
                 expr.is_int = arg.is_int
-            if do_warn != "":
-                warning("Adjacent unary operators: '%s%s'" % (do_warn, arg.asString()))
+            if do_warn and warn != "":
+                warning("Adjacent unary operators: '%s%s'" % (warn, arg.asString()))
         elif oper == "+":             # Unary plus
             oper = self.getOper()
-            do_warn = ""
+            warn = ""
             if self.peekOper() == "+":
-                do_warn = "++"
+                warn = "++"
             elif self.peekOper() == "-":
-                do_warn = "+"
-            expr = self.parsePrefix(is_cond)
-            if do_warn != "":
-                warning("Adjacent unary operators: '%s%s'" % (do_warn, expr.asString()))
+                warn = "+"
+            expr = self.parsePrefix(is_cond, do_warn)
+            if do_warn and warn != "":
+                warning("Adjacent unary operators: '%s%s'" % (warn, expr.asString()))
         elif oper == "!":             # Logical not
             oper = self.getOper()
-            do_warn = ""
+            warn = ""
             if self.peekOper() == "!":
-                do_warn = "!"
-            arg = self.parsePrefix(is_cond)
+                warn = "!"
+            arg = self.parsePrefix(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = arg
-            if do_warn != "":
-                warning("Adjacent unary operators: '%s%s'" % (do_warn, arg.asString()))
+            if do_warn and warn != "":
+                warning("Adjacent unary operators: '%s%s'" % (warn, arg.asString()))
         elif oper == "~":             # Bitwise not
             oper = self.getOper()
-            warning("Unexpected bitwise operator '%s'" % oper)
-            arg = self.parsePrefix(is_cond)
+            if do_warn:
+                warning("Unexpected bitwise operator '%s'" % oper)
+            arg = self.parsePrefix(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = arg
         else:
-            expr = self.parsePostfix(is_cond)
+            expr = self.parsePostfix(is_cond, do_warn)
         return expr
 
-    def parsePower(self, is_cond):
-        expr = self.parsePrefix(is_cond)
+    def parsePower(self, is_cond, do_warn):
+        expr = self.parsePrefix(is_cond, do_warn)
         if self.peekOper() == "**" or (self.parse_units and self.peekOper() == "^"):
             oper = self.getOper()
             lhs = expr
-            rhs = self.parsePower(is_cond)
+            rhs = self.parsePower(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
@@ -1454,7 +1479,7 @@ class Parser:
             elif expr.e2.type == "NAME" and expr.e2.e1 in gParameters:
                 pname = expr.e2.e1
                 other = expr.e1
-            if pname != "":
+            if pname:
                 if other.type == "NUMBER":
                     if expr.type == "+":
                         excl = -other.number
@@ -1517,6 +1542,9 @@ class Parser:
                            (checkParamRangeNeg(pname, False) and checkParamRangePos(pname2, True)) or \
                            (checkParamRangeNeg(pname, True)  and checkParamRangePos(pname2, False)):
                             bad = False  # (pos)-(neg) or (neg)-(pos)
+                        elif checkParamRangeRelation(pname, pname2, ">") or \
+                             checkParamRangeRelation(pname, pname2, "<"):
+                            bad = False  # pname > pname2 so that pname-pname2 > 0
                         else:
                             msg = "expression 1/" + expr.asString()
                             if gVerbose:
@@ -1527,7 +1555,7 @@ class Parser:
                                     msg += gParameters[pname2].getValueRangeStr()
                             zero_factors.append(msg)
         else:
-            if expr.type in ["+", "-"] and not expr.e2:
+            if expr.type in ["+", "-"] and not expr.e2: # unary +/-
                 zeros = getParamZeros(expr.e1, False)
             else:
                 zeros = getParamZeros(expr, False)
@@ -1544,60 +1572,60 @@ class Parser:
         for pname in zero_factors:
             warning("Possible division by zero for %s" % pname)
 
-    def parseMultiplicative(self, is_cond):
-        expr = self.parsePower(is_cond)
+    def parseMultiplicative(self, is_cond, do_warn):
+        expr = self.parsePower(is_cond, do_warn)
         while self.peekOper() in ["*", "/", "%"]:
             oper = self.getOper()
             lhs = expr
-            rhs = self.parsePower(is_cond)
+            rhs = self.parsePower(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
             expr.is_int = lhs.is_int and rhs.is_int
-            if oper == "/":
+            if do_warn and oper == "/":
                 if expr.is_int and not self.parse_units:
                     warning("Integer divide")
                 self.checkExprZero(expr.e2)
         return expr
 
-    def parseAdditive(self, is_cond):
-        expr = self.parseMultiplicative(is_cond)
+    def parseAdditive(self, is_cond, do_warn):
+        expr = self.parseMultiplicative(is_cond, do_warn)
         while self.peekOper() in ["+", "-"]:
             oper = self.getOper()
             lhs = expr
-            rhs = self.parseMultiplicative(is_cond)
+            rhs = self.parseMultiplicative(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
             expr.is_int = lhs.is_int and rhs.is_int
         return expr
 
-    def parseShift(self, is_cond):
-        expr = self.parseAdditive(is_cond)
+    def parseShift(self, is_cond, do_warn):
+        expr = self.parseAdditive(is_cond, do_warn)
         while self.peekOper() in ["<<", ">>", "<<<", ">>>"]:
             oper = self.getOper()
             lhs = expr
-            rhs = self.parseAdditive(is_cond)
+            rhs = self.parseAdditive(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
         return expr
 
-    def parseRelation(self, is_cond):
-        expr = self.parseShift(is_cond)
+    def parseRelation(self, is_cond, do_warn):
+        expr = self.parseShift(is_cond, do_warn)
         while self.peekOper() in ["<", ">", "<=", ">="]:
             oper = self.getOper()
             lhs = expr
-            rhs = self.parseShift(is_cond)
+            rhs = self.parseShift(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
         return expr
 
-    def parseEquality(self, is_cond):
-        expr = self.parseRelation(is_cond)
+    def parseEquality(self, is_cond, do_warn):
+        expr = self.parseRelation(is_cond, do_warn)
         oper = self.peekOper()
-        if is_cond and oper == '=':
+        if do_warn and is_cond and oper == '=':
             error("Found '=' in condition; should be '=='")
             oper = "=="
         while oper in ["==", "!=", "===", "!=="]:
@@ -1605,99 +1633,100 @@ class Parser:
             if is_cond and oper == '=':
                 oper = "=="
             lhs = expr
-            rhs = self.parseRelation(is_cond)
+            rhs = self.parseRelation(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
             oper = self.peekOper()
         return expr
 
-    def parseBitOpers(self, is_cond):
-        expr = self.parseEquality(is_cond)
+    def parseBitOpers(self, is_cond, do_warn):
+        expr = self.parseEquality(is_cond, do_warn)
         while self.peekOper() in ["^~", "~^", "~&", "~|"]:
             oper = self.getOper()
             lhs = expr
-            rhs = self.parseEquality(is_cond)
+            rhs = self.parseEquality(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
         return expr
 
-    def parseBitAnd(self, is_cond):
-        expr = self.parseBitOpers(is_cond)
+    def parseBitAnd(self, is_cond, do_warn):
+        expr = self.parseBitOpers(is_cond, do_warn)
         while self.peekOper() == "&":
             oper = self.getOper()
             lhs = expr
-            rhs = self.parseBitOpers(is_cond)
+            rhs = self.parseBitOpers(is_cond, do_warn)
             warning("Unexpected bitwise operator '%s'" % oper)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
         return expr
 
-    def parseBitXor(self, is_cond):
-        expr = self.parseBitAnd(is_cond)
+    def parseBitXor(self, is_cond, do_warn):
+        expr = self.parseBitAnd(is_cond, do_warn)
         while self.peekOper() == "^":
             oper = self.getOper()
             lhs = expr
-            rhs = self.parseBitAnd(is_cond)
+            rhs = self.parseBitAnd(is_cond, do_warn)
             warning("Unexpected bitwise operator '%s'" % oper)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
         return expr
 
-    def parseBitOr(self, is_cond):
-        expr = self.parseBitXor(is_cond)
+    def parseBitOr(self, is_cond, do_warn):
+        expr = self.parseBitXor(is_cond, do_warn)
         while self.peekOper() == "|":
             oper = self.getOper()
             lhs = expr
-            rhs = self.parseBitXor(is_cond)
-            warning("Unexpected bitwise operator '%s'" % oper)
+            rhs = self.parseBitXor(is_cond, do_warn)
+            if do_warn:
+                warning("Unexpected bitwise operator '%s'" % oper)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
         return expr
 
-    def parseLogicalAnd(self, is_cond):
-        expr = self.parseBitOr(is_cond)
+    def parseLogicalAnd(self, is_cond, do_warn):
+        expr = self.parseBitOr(is_cond, do_warn)
         while self.peekOper() == "&&":
             oper = self.getOper()
             lhs = expr
-            rhs = self.parseBitOr(is_cond)
+            rhs = self.parseBitOr(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
         return expr
 
-    def parseLogicalOr(self, is_cond):
-        expr = self.parseLogicalAnd(is_cond)
+    def parseLogicalOr(self, is_cond, do_warn):
+        expr = self.parseLogicalAnd(is_cond, do_warn)
         while self.peekOper() == "||":
             oper = self.getOper()
             lhs = expr
-            rhs = self.parseLogicalAnd(is_cond)
+            rhs = self.parseLogicalAnd(is_cond, do_warn)
             expr = Expression(oper)
             expr.e1 = lhs
             expr.e2 = rhs
         return expr
 
-    def parseTernary(self, is_cond):
-        cond = self.parseLogicalOr(is_cond)
+    def parseTernary(self, is_cond, do_warn):
+        cond = self.parseLogicalOr(is_cond, do_warn)
         if self.peekOper() == '?':
             self.ternary_cond = cond
             self.getOper()
-            second = self.parseTernary(is_cond)
+            second = self.parseTernary(is_cond, do_warn)
             has_colon = False
             if self.peekOper() == ':':
                 self.getOper()
                 has_colon = True
                 self.ternary_cond = Expression("!")
                 self.ternary_cond.e1 = cond
-            else:
+            elif do_warn:
                 error("Missing ':' in ternary operator")
-            third = self.parseTernary(is_cond)
+            third = self.parseTernary(is_cond, do_warn)
             if third.type == "NOTHING":
-                if has_colon:
+                if do_warn and has_colon:
                     error("Missing expression after ':' in ternary operator")
                 third = Expression("NUMBER")
                 third.number = 0
@@ -1711,9 +1740,9 @@ class Parser:
             expr = cond
         return expr
 
-    def getExpression(self, is_cond=False):
+    def getExpression(self, is_cond=False, do_warn=True):
         self.eatSpace()
-        return self.parseTernary(is_cond)
+        return self.parseTernary(is_cond, do_warn)
 
     def checkBusIndex(self, name):
         if self.peekChar() == '[':
@@ -1863,7 +1892,7 @@ class Parser:
 # functions
 
 def fatal( message ):  # pragma: no cover
-    if len(gLineNo) > 0:
+    if gLineNo:
         print("FATAL: File %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
     else:
         print("FATAL: %s" % message)
@@ -1879,7 +1908,7 @@ def error( message, type=None ):
     count += 1
     gErrorMsgDict[type] = count
     if (count <= gMaxNum or gMaxNum == 0) and not gPreProcess:
-        if len(gLineNo) > 0:
+        if gLineNo:
             print("ERROR in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
         else:  # pragma: no cover
             print("ERROR: %s" % message)
@@ -1896,7 +1925,7 @@ def warning( message, type=None ):
     count += 1
     gWarningMsgDict[type] = count
     if (count <= gMaxNum or gMaxNum == 0) and not gPreProcess:
-        if len(gLineNo) > 0:
+        if gLineNo:
             print("WARNING in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
         else:  # pragma: no cover
             print("WARNING: %s" % message)
@@ -1913,7 +1942,7 @@ def style( message, type=None ):
     count += 1
     gStyleMsgDict[type] = count
     if (count <= gMaxNum or gMaxNum == 0) and not gPreProcess:
-        if len(gLineNo) > 0:
+        if gLineNo:
             print("STYLE in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
         else:  # pragma: no cover
             print("STYLE: %s" % message)
@@ -1930,7 +1959,7 @@ def notice( message, type=None ):
     count += 1
     gNoticeMsgDict[type] = count
     if (count <= gMaxNum or gMaxNum == 0) and not gPreProcess:
-        if len(gLineNo) > 0:
+        if gLineNo:
             print("NOTICE in file %s, line %d: %s" % (gFileName[-1], gLineNo[-1], message))
         else:  # pragma: no cover
             print("NOTICE: %s" % message)
@@ -2034,6 +2063,14 @@ def getParamZeros( expr, signed ):
     if expr.type == "NAME":
         if expr.e1 in gParameters:
             ret.append(expr.e1)
+        else:
+            vname = findVariableInScope(expr.e1)
+            if vname in gVariables:
+                deps = getCurrentConditionDeps()
+                if expr.e1 not in deps:
+                    for fac in gVariables[vname].zeros:
+                        if fac not in deps or (not signed and fac in gParameters):
+                            ret.append(fac)
     elif expr.type == "*":
         ret += getParamZeros(expr.e1, signed)
         ret += getParamZeros(expr.e2, signed)
@@ -2056,7 +2093,12 @@ def getParamZeros( expr, signed ):
     elif expr.type == "FUNCCALL" and expr.e1 in ["sqrt", "$sqrt", "pow", "$pow",
             "sin", "$sin", "asin", "$asin", "sinh", "$sinh", "asinh", "$asinh",
             "tan", "$tan", "atan", "$atan", "tanh", "$tanh", "atanh", "$atanh"]:
-        ret += getParamZeros(expr.args[0], signed)
+        arg = getParamZeros(expr.args[0], signed)
+        if expr.e1 in ["pow", "$pow"] and len(expr.args) == 2 and expr.args[1].type == "NUMBER" \
+                and int(expr.args[1].number) == expr.args[1].number:
+            ret += arg * int(expr.args[1].number)
+        else:
+            ret += arg
     return ret
 
 
@@ -2147,6 +2189,27 @@ def checkParamRangeNeg( pname, allow_zero ):
     return False
 
 
+# see if the range of par1 is restricted by par2
+def checkParamRangeRelation( pname1, pname2, ineq ):
+    par1 = gParameters[pname1]
+    par2 = gParameters[pname2]
+    if ineq == '>':
+        if par1.value_range in ["oo", "oc"] and par1.min.type == "NAME" and par1.min.e1 == pname2:
+            # par1 from (par2:upper)
+            return True
+        if par2.value_range in ["oo", "co"] and par2.max.type == "NAME" and par2.max.e1 == pname1:
+            # par2 from (lower:par1)
+            return True
+    elif ineq == '<':
+        if par1.value_range in ["oo", "co"] and par1.max.type == "NAME" and par1.max.e1 == pname2:
+            # par1 from (lower:par2)
+            return True
+        if par2.value_range in ["oo", "oc"] and par2.min.type == "NAME" and par2.min.e1 == pname1:
+            # par2 from (par1:upper)
+            return True
+    return False
+
+
 # not comprehensive
 def exprIsPositive( expr ):
     ret = False
@@ -2172,7 +2235,6 @@ def checkConditionsExcludeOper( oper, e1, e2, negated, pname, exval, recurse ):
         val_ge = False
         val_lt = False
         val_le = False
-        val = 0
         do_abs = 0
         if exval == 0:
             # special case for excluding 0, if inequality involves
@@ -2180,15 +2242,22 @@ def checkConditionsExcludeOper( oper, e1, e2, negated, pname, exval, recurse ):
             if e1.type == "NAME" and e1.e1 not in gParameters:
                 vname = findVariableInScope(e1.e1)
                 if vname in gVariables:
-                    zeros = gVariables[vname].zeros
-                    if pname in zeros:
+                    var = gVariables[vname]
+                    if pname in var.zeros:
                         pname = vname
+                    elif var.type == "integer":
+                        for [val, cond] in var.integer_vals:
+                            if val != exval and cond.find(pname) >= 0:
+                                parser = Parser(cond)
+                                cond = parser.getExpression(True, False)
+                                if cond.type != "NOTHING":
+                                    return checkConditionsExcludeOper(cond.type, cond.e1, cond.e2, negated, pname, 0, True)
             elif e2.type == "NAME" and e2.e1 not in gParameters:
                 vname = findVariableInScope(e2.e1)
                 if vname in gVariables:
-                    zeros = gVariables[vname].zeros
-                    if pname in zeros:
+                    if pname in gVariables[vname].zeros:
                         pname = vname
+        val = 0
         if e1.type == "NAME" and pname == e1.e1:
             val = e2
             if   (oper == "==" and not negated) or (oper == "!=" and negated):
@@ -2570,7 +2639,7 @@ def getAttributes( line, in_attrib ):
     if stop == 0:
         line = line[stop+2:]
         line = line.strip()
-        if len(line) > 0 and line[0] == ';':
+        if line and line[0] == ';':
             warning("Attribute should prefix the item to which it applies")
         start = line.find("(*")
         start2 = start + 2
@@ -2811,7 +2880,45 @@ def parseUndef( line ):
             error("Missing macro name after `undef")
 
 
-def replaceFormalWithActual( text, args, actuals, check_collision ):
+# check expr for 'arg' in an operation with higher precedence than 'oper'
+# for example, '2 * arg' when oper is '+'
+def checkOrderOfOperations(expr, arg, oper):
+    ret = False
+    if expr.type in ["NUMBER", "NAME", "STRING", "ARRAY", "EVENT"]:
+        return False
+    if expr.type == "FUNCCALL":
+        for func_arg in expr.args:
+            ret = checkOrderOfOperations(func_arg, arg, oper)
+            if ret:
+                break
+    elif expr.type == "?:":
+        # e1 and e2 checked below
+        ret = checkOrderOfOperations(expr.e3, arg, oper)
+    elif expr.type == "-" and not expr.e2:
+        if oper in ["+", "-"] and expr.e1.type == "NAME" and expr.e1.e1 == arg and not expr.e1.parens:
+            ret = True
+    elif expr.type in gOperatorPrecedence:
+        expr_prec = gOperatorPrecedence[expr.type]
+        if oper in gOperatorPrecedence:
+            oper_prec = gOperatorPrecedence[oper]
+            if oper_prec < expr_prec:
+                if expr.e1.type == "NAME" and expr.e1.e1 == arg and not expr.e1.parens:
+                    ret = True
+                if expr.e2 and expr.e2.type == "NAME" and expr.e2.e1 == arg and not expr.e2.parens:
+                    ret = True
+            elif oper_prec == expr_prec and expr.e2:
+                if expr.e2.type == "NAME" and expr.e2.e1 == arg and not expr.e2.parens:
+                    if expr.type in ["/", "-"]:
+                        ret = True
+    if not ret and expr.type in ["+", "-", "*", "/", "%", "**", "?:"]:
+        ret = checkOrderOfOperations(expr.e1, arg, oper)
+        if not ret and expr.e2:
+            ret = checkOrderOfOperations(expr.e2, arg, oper)
+    return ret
+
+
+# for macro expansion
+def replaceFormalWithActual( name, text, args, actuals, check_collision ):
     # check if actual argument contains match for later formal argument
     if check_collision:
         collide = False
@@ -2819,9 +2926,12 @@ def replaceFormalWithActual( text, args, actuals, check_collision ):
             act = actuals[i]
             for j in range(i+1, len(args)):
                 arg = args[j]
-                if act.find(arg) >= 0:
-                    collide = True
-                    break
+                idx = act.find(arg)
+                if idx >= 0:
+                    idx += len(arg) + 1
+                    if len(act) <= idx or not act[idx].isalnum():
+                        collide = True
+                        break
             if collide:
                 break
         if collide:
@@ -2829,10 +2939,74 @@ def replaceFormalWithActual( text, args, actuals, check_collision ):
             for arg in args:
                 arg = "ARGUMENT__" + arg
                 newargs.append(arg)
-            newtext = replaceFormalWithActual(text, args, newargs, False)
+            newtext = replaceFormalWithActual(name, text, args, newargs, False)
             text = newtext
             args = newargs
+    actual_exprs = []
+    actual_check = []
+    for i in range(len(actuals)):
+        act = actuals[i]
+        parser = Parser(act)
+        expr = parser.getExpression(False, False)
+        if expr.type == "-" and not expr.e2:
+            actual_exprs.append("u-")
+        else:
+            actual_exprs.append(expr.type)
+        if act[0] == '(' and act[-1] == ')':
+            actual_check.append(0)
+        elif expr.type in ["NUMBER", "NAME", "STRING", "FUNCCALL", "ARRAY", "EVENT"]:
+            actual_check.append(0)
+        else:
+            actual_check.append(1)
     for i in range(len(args)):
+        if actual_check[i]:
+            arg = args[i]
+            lines = text.split('\n')
+            for line in lines:
+                if line.find(arg) >= 0:
+                    line = getAttributes(line.strip(), "")[0]
+                    parts = line.split()
+                    keywd = parts[0]
+                    expr_to_check = False
+                    if keywd in ["parameter", "localparam", "aliasparam"]:
+                        # parameter declaration, check default value (and range?)
+                        parm_list = parseParamDecl(line, "", False)
+                        for parm in parm_list:
+                            if checkOrderOfOperations(parm.defv, arg, actual_exprs[i]):
+                                argp = arg
+                                if len(arg) > 10 and arg[0:10] == "ARGUMENT__":
+                                    argp = arg[10:]
+                                error("Order-of-operations problem replacing '%s' with '%s' in macro '%s'"
+                                      % (argp, actuals[i], name))
+                                if gDebug:
+                                    print("    %s" % line)
+                    elif keywd in ["real", "integer", "genvar", "string", "input", "output", "inout"]:  # pragma: no cover
+                        # variable/port declaration
+                        pass
+                    elif keywd in ["if", "begin", "end", "else"]:
+                        parser = False
+                        for pos in range(len(parts)):
+                            if parts[pos] == "if":
+                                parser = Parser("".join(parts[pos+1:]))
+                                break
+                        if parser:
+                            expr_to_check = parser.getExpression(False, False)
+                    elif len(parts) > 1 and parts[1] == "=":
+                        # assignment
+                        parser = Parser("".join(parts[2:]))
+                        expr_to_check = parser.getExpression(False, False)
+                    else:
+                        parser = Parser(line)
+                        expr_to_check = parser.getExpression(False, False)
+                    if expr_to_check:
+                        if checkOrderOfOperations(expr_to_check, arg, actual_exprs[i]):
+                            argp = arg
+                            if len(arg) > 10 and arg[0:10] == "ARGUMENT__":
+                                argp = arg[10:]
+                            error("Order-of-operations problem replacing '%s' with '%s' in macro '%s'"
+                                  % (argp, actuals[i], name))
+                            if gDebug:
+                                print("    %s" % line)
         arg = args[i]
         in_quote = False
         word_bnd = True
@@ -2892,7 +3066,7 @@ def expandMacro( line ):
             gMacros[name].used = True
             text = gMacros[name].text
             args = gMacros[name].args
-            if i < len(line) and line[i] == '(' and len(args) > 0:
+            if i < len(line) and line[i] == '(' and args:
                 nparens = 1
                 i += 1
                 in_quote = False
@@ -2914,12 +3088,12 @@ def expandMacro( line ):
                             nparens -= 1
                             if nparens == 0:
                                 if arg != "":
-                                    actuals.append(arg)
+                                    actuals.append(arg.strip())
                                     arg = ""
                             else:
                                 arg += ch
                         elif ch == ',' and nparens == 1:
-                            actuals.append(arg)
+                            actuals.append(arg.strip())
                             arg = ""
                         elif ch == "\n":
                             arg += ' '
@@ -2927,16 +3101,16 @@ def expandMacro( line ):
                             arg += ch
                     i += 1
                 if arg != "":
-                    actuals.append(arg)
+                    actuals.append(arg.strip())
                 if nparens > 0:
                     error("Missing ')' in macro call")
                 if len(args) == len(actuals):
-                    text = replaceFormalWithActual(text, args, actuals, True)
+                    text = replaceFormalWithActual(name, text, args, actuals, True)
                 else:  # pragma: no cover
                     fatal("Macro `%s called with %d arguments, expected %d" % (name, len(actuals), len(args)))
-            elif len(args) > 0:
+            elif args:
                 error("Macro `%s called without arguments, expected %d" % (name, len(args)))
-            if len(text) > 0 and text[-1] == ';' and len(line) > i and line[i] == ';':
+            if text and text[-1] == ';' and len(line) > i and line[i] == ';':
                 warning("Expansion of macro '%s' results in repeated ';'" % name)
             string = line[0:pos]
             string += text
@@ -3205,7 +3379,7 @@ def parseDisciplineLine( line ):
 # reset all macros
 def resetMacros():
     global gMacros
-    gMacros      = {}
+    gMacros = {}
     # predefined macros
     mac1 = Macro("__VAMS_ENABLE__", "")
     mac1.used = True
@@ -3306,20 +3480,20 @@ def printModuleSummary():
                     inst_parms[k] = p
                 if p.model:  # can be both model and inst
                     model_parms[k] = p
-            if p.scale == "\"linear\"":
-                lin_scale.append(p.name)
-            elif p.scale == "\"quadratic\"":
-                quad_scale.append(p.name)
+                if p.scale == "\"linear\"":
+                    lin_scale.append(p.name)
+                elif p.scale == "\"quadratic\"":
+                    quad_scale.append(p.name)
         if len(inst_parms):
             if gVerbose or len(inst_parms) < 20:
                 print("\nInstance parameters (%d):" % len(inst_parms))
                 printList(inst_parms.keys(), "    ", 70)
             else:
                 print("\nInstance parameters (%d)" % len(inst_parms))
-            if len(lin_scale) > 0:
+            if lin_scale:
                 print("  Linear scaling:")
                 printList(lin_scale, "    ", 70)
-            if len(quad_scale) > 0:
+            if quad_scale:
                 print("  Quadratic scaling:")
                 printList(quad_scale, "    ", 70)
             if gPrDefVals:
@@ -3495,10 +3669,10 @@ def parseFunction( line ):
 # end of parseFunction
 
 
-def parseParamDecl( line, attribs ):
+def parseParamDecl( line, attribs, in_module ):
     global gCheckMultFactors
-    in_module = True
 
+    parm_list = []
     parm_or_alias = ""
     parser = Parser(line)
     val = parser.lex()
@@ -3520,8 +3694,20 @@ def parseParamDecl( line, attribs ):
                     model = False
                 elif val in ["both", "\"both\""]:
                     inst = True
+                if val in ["instance", "model", "both"]:
+                    error("Attribute value should be in quotes")
             elif attribs[i] == "units":
-                units = attribs[i+1].strip('"').strip()
+                units = attribs[i+1].strip('"')
+                if gStyle and units != units.strip():
+                    style("Extra space in units attribute")
+                units = units.strip()
+            elif attribs[i] == "desc":
+                desc = attribs[i+1].strip('"')
+                if gStyle and desc != desc.strip():
+                    if desc[0] == ' ':
+                        style("Extra space at start of desc attribute")
+                    if desc[-1] == ' ':
+                        style("Extra space at end of desc attribute")
             elif attribs[i] == "scale":
                 val = attribs[i+1]
                 if val in ["\"linear\"", "\"quadratic\""]:
@@ -3607,34 +3793,35 @@ def parseParamDecl( line, attribs ):
 
         if val != ord('='):
             error("Incomplete %s specification" % parm_or_alias)
-            return
+            return parm_list
 
         parm.defv = parser.getExpression()
-        if parm.defv.type == "ARRAY" or len(parm.range) > 0:
-            if parm.defv.type != "ARRAY":
-                error("Array parameter '%s' needs array of default values" % pname)
-            elif len(parm.range) == 0:
-                error("Non-array parameter '%s' has array of default values" % pname)
-            else:
-                nump = parm.range[1] - parm.range[0]
-                if nump > 0:
-                    nump += 1
+        if in_module:
+            if parm.defv.type == "ARRAY" or len(parm.range) > 0:
+                if parm.defv.type != "ARRAY":
+                    error("Array parameter '%s' needs array of default values" % pname)
+                elif len(parm.range) == 0:
+                    error("Non-array parameter '%s' has array of default values" % pname)
                 else:
-                    nump = 1 - nump
-                if nump != len(parm.defv.args):
-                    error("Array parameter '%s' has different dimension than array of default values" % pname)
+                    nump = parm.range[1] - parm.range[0]
+                    if nump > 0:
+                        nump += 1
+                    else:
+                        nump = 1 - nump
+                    if nump != len(parm.defv.args):
+                        error("Array parameter '%s' has different dimension than array of default values" % pname)
 
         if parm_or_alias == "aliasparam":
             if parm.defv.type == "NAME" and parm.defv.e1 in gParameters:
                 parm.type = gParameters[parm.defv.e1].type
                 gParameters[parm.defv.e1].used += 1
-            else:
+            elif in_module:
                 error("Default value for aliasparam '%s' must be a parameter" % pname)
             val = parser.lex()
             parm.used += 1
             parm.is_alias = True
 
-        else:
+        elif in_module:
             if parm.defv.type == "NAME" and parm.defv.e1 in gParameters:
                 dparm = gParameters[parm.defv.e1]
                 if dparm.units and units and dparm.units != units:
@@ -3660,7 +3847,7 @@ def parseParamDecl( line, attribs ):
                     else:
                         u2 = "no units"
                     notice("Parameter '%s' with %s has default '%s' with %s" % (pname, u1, dparm.name, u2))
-            deps = parm.defv.getDependencies(False, False)
+            deps = parm.defv.getDependencies(False, False, True)
             for dep in deps:
                 if dep == pname:
                     error("Parameter '%s' default value may not depend on itself" % pname)
@@ -3688,6 +3875,7 @@ def parseParamDecl( line, attribs ):
                     else:
                         error("Parameter '%s' default value depends on unknown identifier '%s'" % (pname, dep))
 
+        if parm_or_alias != "aliasparam":
             val = parser.lex()
             parse_error = False
             while parser.isIdentifier():
@@ -3741,7 +3929,7 @@ def parseParamDecl( line, attribs ):
                 else:  # pragma: no cover
                     fatal("Unexpected '%s' in parameter declaration" % string)
 
-        if parm.defv.type == "NUMBER":
+        if in_module and parm.defv.type == "NUMBER":
             num = parm.defv.number
             if num in parm.exclude:
                 warning("Default value of %s=%d is excluded from range" % (parm.name, num))
@@ -3752,12 +3940,17 @@ def parseParamDecl( line, attribs ):
                 elif parm.max.type == "NUMBER" and (parm.max.number < num \
                         or (parm.value_range in ["co", "oo"] and parm.max.number == num)):
                     warning("Default value of %s=%d is too large" % (parm.name, num))
+        if not in_module:
+            parm_list.append(parm)
 
-    if val != ord(';'):
-        if not parse_error:
-            error("Missing ';' at end of %s declaration" % parm_or_alias)
-    elif parser.peekChar() == ';':
-        error("Extra ';' at end of %s declaration" % parm_or_alias)
+    if in_module:
+        if val != ord(';'):
+            if not parse_error:
+                error("Missing ';' at end of %s declaration" % parm_or_alias)
+        elif parser.peekChar() == ';':
+            error("Extra ';' at end of %s declaration" % parm_or_alias)
+
+    return parm_list
 # end of parseParamDecl
 
 
@@ -3772,7 +3965,7 @@ def parseVariableDecl( line, attribs ):
     oppt = False
     units = ""
     multi = ""
-    if len(attribs) > 0:
+    if attribs:
         for i in range(0, len(attribs), 2):
             if attribs[i] == "units":
                 oppt = True
@@ -3824,7 +4017,7 @@ def parseVariableDecl( line, attribs ):
                         warning("Unexpected multiplicity=%s for operating-point variable '%s' with %s"
                                 % (multi, var.name, unitstr), "multiplicity")
                 gVariables[vname] = var
-                if len(gScopeList) > 0 and gScopeList[-1].startswith("FUNCTION::"):
+                if gScopeList and gScopeList[-1].startswith("FUNCTION::"):
                     if gCurrentFunc:
                         if string in gCurrentFunc.inputs:
                             # hack, not really where it was assigned a value
@@ -3906,7 +4099,7 @@ def parsePortDirection( line ):
                         if gCompactModel:
                             warning("Port direction '%s' should be 'inout'" % ptype)
                 elif ptype == "inout":
-                    if len(gScopeList) > 0 and gScopeList[-1].startswith("FUNCTION::"):
+                    if gScopeList and gScopeList[-1].startswith("FUNCTION::"):
                         warning("'inout' function arguments are not recommended")
                 elif ptype in ["real", "integer", "string"]:
                     # input x; real x; OK for functions
@@ -3926,7 +4119,7 @@ def parsePortDirection( line ):
         if parser.isIdentifier():
             pname = parser.getString()
             escaped = parser.isEscaped()
-            if len(gScopeList) > 0 and gScopeList[-1].startswith("FUNCTION::"):
+            if gScopeList and gScopeList[-1].startswith("FUNCTION::"):
                 if gCurrentFunc:
                     if pname in gCurrentFunc.args:
                         if ptype in ["real", "integer", "string"]:
@@ -4214,6 +4407,8 @@ def getFactors( expr ):
         ret.append(expr.e1)
         if expr.e1 in ["ddt", "ddx", "white_noise", "flicker_noise"]:
             ret += getFactors(expr.args[0])
+        if expr.e1 in ["white_noise", "flicker_noise"]:
+            ret.append("END_NOISE_CALL")
     elif expr.type == "*":
         ret += getFactors(expr.e1)
         ret += getFactors(expr.e2)
@@ -4233,17 +4428,27 @@ def getFactors( expr ):
     return ret
 
 
-def countMultFactors( mname, factors ):
+def countMultFactors( mname, factors, noise ):
     count = 0
     errs = []
+    inside = ""
+    in_noise = False
     for fac in factors:
-        if fac == mname:
+        if noise and fac == noise:
+            in_noise = True
+        elif in_noise and fac == "END_NOISE_CALL":
+            in_noise = False
+        elif fac == mname:
+            if noise and not in_noise:
+                inside = fac
             count += 1
         elif fac in gMultFactors and fac not in errs:
             error("Contribution has unexpected factor of %s (expected %s)" % (fac, mname))
             errs.append(fac)
     if count > 1:
         error("Contribution has extra factor of %s" % mname)
+    elif inside:
+        error("Factor '%s' should be inside call to %s()" % (inside, noise))
 
 
 def checkMultFactors( rhs ):
@@ -4268,9 +4473,9 @@ def checkMultFactors( rhs ):
         factors = getFactors(part)
         if "flicker_noise" in factors:
             if "mult_fn" in factors:
-                countMultFactors("mult_fn", factors)
+                countMultFactors("mult_fn", factors, "flicker_noise")
             elif "MULT_FN" in factors:
-                countMultFactors("MULT_FN", factors)
+                countMultFactors("MULT_FN", factors, "flicker_noise")
             else:
                 if "MULT_I" in factors:
                     error("Flicker noise contribution uses MULT_I instead of MULT_FN")
@@ -4280,11 +4485,20 @@ def checkMultFactors( rhs ):
                     error("Flicker noise contribution missing MULT_FN")
                 else:
                     error("Flicker noise contribution missing mult_fn")
+        elif "white_noise" in factors:
+            if "mult_i" in factors:
+                countMultFactors("mult_i", factors, "white_noise")
+            elif "MULT_I" in factors:
+                countMultFactors("MULT_I", factors, "white_noise")
+            elif "MULT_I" in gParameters:
+                error("Noise contribution missing MULT_I")
+            else:
+                error("Noise contribution missing mult_i")
         elif "ddt" in factors:
             if "mult_q" in factors:
-                countMultFactors("mult_q", factors)
+                countMultFactors("mult_q", factors, "")
             elif "MULT_Q" in factors:
-                countMultFactors("MULT_Q", factors)
+                countMultFactors("MULT_Q", factors, "")
             else:
                 if "MULT_I" in factors:
                     error("Charge contribution uses MULT_I instead of MULT_Q")
@@ -4296,9 +4510,9 @@ def checkMultFactors( rhs ):
                     error("Charge contribution missing mult_q")
         else:
             if "mult_i" in factors:
-                countMultFactors("mult_i", factors)
+                countMultFactors("mult_i", factors, "")
             elif "MULT_I" in factors:
-                countMultFactors("MULT_I", factors)
+                countMultFactors("MULT_I", factors, "")
             elif "MULT_I" in gParameters:
                 error("Current contribution missing MULT_I")
             else:
@@ -4539,7 +4753,7 @@ def checkMultDeclaration( parm ):
 def getPrimaryParameter( name, alt ):
     ret = False
     if name in gParameters:
-        ret  = gParameters[name]
+        ret = gParameters[name]
     if alt in gParameters:
         if ret and not ret.is_alias and not gParameters[alt].is_alias:
             error("Both '%s' and '%s' declared" % (name, alt))
@@ -4637,7 +4851,7 @@ def checkParmsAndVars():
             warning("Module uses $temperature but does not have 'tref'")
         if not has_dtemp:
             warning("Module uses $temperature but does not have 'dtemp'")
-    if len(not_lower) > 0:
+    if not_lower:
         if len(not_upper) == 0:
             if gStyle and gCompactModel:
                 style("Parameters should be declared in lowercase")
@@ -4851,7 +5065,7 @@ def checkParmsAndVars():
 
     for func in gUserFunctions.values():
         if func.used:
-            if len(func.outputs) > 0:
+            if func.outputs:
                 for i in range(len(func.args)):
                     if not func.outarg_used[i]:
                         warning("Function '%s' output argument '%s' is never used"
@@ -4893,7 +5107,7 @@ def getIdentifierType( name ):
 
 def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt, do_warn ):
     global gUsesDDT
-    [conds, bias_dep] = getCurrentConditions(Expression("NOTHING"), bias_dep_in)
+    [conds, bias_dep] = getCurrentConditions(0, bias_dep_in)
     biases = []
     ddt_call = 0
     if is_condition:
@@ -4947,7 +5161,7 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt
                 is_set = True
                 if assign == -2 and not unset_message.startswith("Task") and do_warn and gCompactModel:
                     warning("%s %s, which should not appear in a compact model" % (unset_message, dep))
-            if len(gVariables[vn].conditions) > 0:
+            if gVariables[vn].conditions:
                 if not conditionCovered(conds, gVariables[vn].conditions):
                     if do_warn and gDebug:
                         if conds == "":
@@ -5008,8 +5222,8 @@ def checkDependencies( deplist, unset_message, bias_dep_in, is_condition, no_ddt
 
 
 def registerLoopVariableUse( loop_cond, loop_info ):
-    deps = loop_cond.getDependencies(False, False)
-    conds = getCurrentConditions(Expression("NOTHING"), 0)[0]
+    deps = loop_cond.getDependencies(False, False, False)
+    conds = getCurrentConditions(0, 0)[0]
     done = []
     for dep in deps:
         vn = findVariableInScope(dep)
@@ -5235,7 +5449,7 @@ def checkCondForBiasDepEquality( cond ):
             if fname in gUserFunctions and gUserFunctions[fname].type == "integer":
                 is_integer_test += 2
         if is_integer_test != 3:
-            deps = cond.getDependencies(False, False)
+            deps = cond.getDependencies(False, False, False)
             bias_dep = checkDependencies(deps, "", 0, True, True, False)[0]
             if bias_dep > 1:
                 ret = True
@@ -5293,7 +5507,7 @@ def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, bias_in, ddt_in
                 var.conditions = [conds]
             var.bias_dep = bias_dep
             var.biases = biases
-        elif len(var.conditions) > 0:
+        elif var.conditions:
             if conds in ["", "NOT(0)"]:
                 # no conditions for this assignment
                 var.conditions = []
@@ -5321,7 +5535,7 @@ def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, bias_in, ddt_in
                     conds == "NOT(" + var.prev_assign[0] + ")":
                 var.bias_dep = 0
         if conds == "":  # replace previous biases
-            var.biases   = biases
+            var.biases = biases
         else:  # append these biases, possibly overkill
             for bias in biases:
                 if bias not in var.biases:
@@ -5329,11 +5543,11 @@ def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, bias_in, ddt_in
         if rhs and rhs.type != "NONE":
             zeros = getParamZeros(rhs, False)
             factors = getFactors(rhs)
-            if len(deps) > 0:
+            if deps:
                 for mname in gMultFactors:
                     if mname in deps and mname not in factors:
                         error("Variable '%s' has an invalid dependence on %s" % (varname, mname))
-            if not first_assign and conds != "" and (len(var.factors) > 0 or len(factors) > 0):
+            if not first_assign and conds != "" and (var.factors or factors):
                 if var.non_zero_assign and (rhs.type != "NUMBER" or rhs.number != 0):
                     for mname in gMultFactors:
                         if (mname in factors and mname not in var.factors) or \
@@ -5343,16 +5557,23 @@ def markVariableAsSet( varname, rhs, deps, bias_dep_in, cond_in, bias_in, ddt_in
                 var.zeros = zeros
                 var.factors = factors
             else:
-                if len(var.zeros) > 0 and len(zeros) > 0:
+                if var.zeros and zeros:
                     var.zeros = [zer for zer in var.zeros if zer in zeros]
                 else:
                     var.zeros = []
-                if len(var.factors) > 0 and len(factors) > 0:
+                if var.factors and factors:
                     var.factors = [fac for fac in var.factors if fac in factors]
                 else:
                     var.factors = []
             if rhs.type != "NUMBER" or rhs.number != 0:
                 var.non_zero_assign = True
+            if bias_dep == 0 and conds:
+                cond_deps = getCurrentConditionDeps()
+                for cd in cond_deps:
+                    if cd not in var.cond_deps:
+                        var.cond_deps.append(cd)
+                if var.type == "integer" and rhs.type == "NUMBER":
+                    var.integer_vals.append([rhs.number, conds])
         else:
             var.zeros = []
             var.factors = []
@@ -5506,15 +5727,16 @@ def compareUnits( num1, den1, cnt1, num2, den2, cnt2, add ):
 
 
 # check units of binning parameter against main parameter
-def checkBinUnits( spar, prefix, name, units ):
+def checkBinUnits( spar, prefix, name, units, factor ):
     if isinstance(units, str) or isinstance(spar.units, str):
         [nump, denp, cntp] = parseUnitsString(units)
         [nums, dens, cnts] = parseUnitsString(spar.units)
         bad_units = False
         expect = "?"
         prefix = prefix.upper()
-        if gBinningFactors and prefix in gBinningFactors:
-            expect = gBinningFactors[prefix]
+        prefix_factor = prefix + factor
+        if gBinningFactors and prefix_factor in gBinningFactors:
+            expect = gBinningFactors[prefix_factor]
 
             if units in ("", "-"):
                 if spar.units != expect:
@@ -5525,6 +5747,8 @@ def checkBinUnits( spar, prefix, name, units ):
             elif not compareUnits(nump, denp, cntp, nums, dens, cnts, expect):
                 if units[0] == '/':
                     bad_units = expect + units
+                elif len(expect) > 2 and expect[0:2] == "1/":
+                    bad_units = units + expect[1:]
                 else:
                     bad_units = units + "*" + expect
 
@@ -5571,7 +5795,7 @@ def checkBinUnits( spar, prefix, name, units ):
                     expect = "m^2"
 
             if expect != "?":
-                gBinningFactors[prefix] = expect
+                gBinningFactors[prefix_factor] = expect
                 if gDebug:
                     notice("Binning factor for %s-parameters set to '%s'" % (prefix, expect))
             elif units and (not spar.units or spar.units == "-"):
@@ -5702,12 +5926,12 @@ def checkBinningTerm( t_in, pname, punit ):
             if len(sname) > len(pname) and pname == sname[len(sname)-len(pname):]:
                 # LPAR, WPAR, PPAR, P2PAR, etc.
                 pfx = sname[0:len(sname)-len(pname)]
-                checkBinUnits(spar, pfx, pname, punit)
+                checkBinUnits(spar, pfx, pname, punit, oper+fact)
             elif (pname[-1].lower() == 'o' or pname[-1] == '0') and \
                     pname[:-1] == sname[0:len(pname)-1]:
                 # PARO and PARL, PARWL, etc.
                 sfx = sname[len(pname)-1:]
-                checkBinUnits(spar, sfx, pname, punit)
+                checkBinUnits(spar, sfx, pname, punit, oper+fact)
             elif pname[0:2].lower() == 'po' and pname[2:] == sname[len(sname)-len(pname)+2:]:
                 # POPAR and LPAR, WPAR, etc.
                 pfx = sname[0:2]
@@ -5863,7 +6087,7 @@ def parseOther( line ):
     keywd = ""
 
     got_paren = False
-    if val == ord('(') and len(gScopeList) > 0 and gScopeList[-1].startswith("CASE::"):
+    if val == ord('(') and gScopeList and gScopeList[-1].startswith("CASE::"):
         got_paren = True
         val = parser.lex()
 
@@ -5882,7 +6106,7 @@ def parseOther( line ):
                 analog_block = "initial"
 
     if parser.isNumber() or (keywd == "default" and parser.peekToken() == ":"):
-        if len(gScopeList) > 0 and gScopeList[-1].startswith("CASE::"):
+        if gScopeList and gScopeList[-1].startswith("CASE::"):
             case_val = 0
             if parser.isNumber():
                 # case 0: begin ...
@@ -5933,22 +6157,22 @@ def parseOther( line ):
             gStatementInCurrentBlock = True
 
         if keywd == "end":
-            if len(gScopeList) > 0:
+            if gScopeList:
                 scope = gScopeList.pop()
                 col = scope.find("::")
                 if col > 0:
                     error("Found 'end' instead of 'end%s'" % scope[0:col].lower())
             else:
                 error("Found 'end' without corresponding 'begin'")
-            if len(gLoopTypes) > 0:
+            if gLoopTypes:
                 last_loop = gLoopTypes.pop()
-            if len(gConditions) > 0:
+            if gConditions:
                 last_cond = gConditions.pop()
-            if len(gCondBiasDep) > 0:
+            if gCondBiasDep:
                 last_c_bd = gCondBiasDep.pop()
-            if len(gAnalogBlock) > 0:
+            if gAnalogBlock:
                 gAnalogBlock.pop()
-            if len(gAnalogBlock) > 0:
+            if gAnalogBlock:
                 analog_block = gAnalogBlock[-1]
             else:
                 analog_block = "None"
@@ -5997,7 +6221,7 @@ def parseOther( line ):
                 error("Missing condition for 'if'")
                 deps = []
             else:
-                deps = new_cond.getDependencies(False, False)
+                deps = new_cond.getDependencies(False, False, True)
             [bias_dep, biases, ddt] = checkDependencies(deps, "If condition depends on", 0, "if", True, True)
             if this_cond.type == "NOTHING":
                 this_cond = new_cond
@@ -6072,7 +6296,7 @@ def parseOther( line ):
                         deps = [init_expr.e1]
                         checkDependencies(deps, "For loop initialization depends on", 0, False, True, True)
                     else:
-                        # deps = init_expr.getDependencies(False, False)
+                        # deps = init_expr.getDependencies(False, False, True)
                         bad_init = True
                         if gDebug:  # pragma: no cover
                             notice("For loop init type %s" % init_expr.type)
@@ -6086,7 +6310,7 @@ def parseOther( line ):
                 error("Missing ';' in for loop")
             this_cond = parser.getExpression(True)
             if this_cond.type != "NOTHING":
-                deps = this_cond.getDependencies(False, False)
+                deps = this_cond.getDependencies(False, False, True)
                 [bias_dep, biases, ddt] = checkDependencies(deps, "For loop condition depends on", 0, "for", True, True)
                 val = parser.lex()
             else:
@@ -6166,7 +6390,7 @@ def parseOther( line ):
         if keywd == "while":
             this_loop = keywd
             this_cond = parser.getExpression(True)
-            deps = this_cond.getDependencies(False, False)
+            deps = this_cond.getDependencies(False, False, True)
             [bias_dep, biases, ddt] = checkDependencies(deps, "While condition depends on", 0, "while", True, True)
             this_c_bd = bias_dep
             val = parser.lex()
@@ -6250,7 +6474,7 @@ def parseOther( line ):
                 keywd = parser.getString()
                 if keywd == "if":
                     new_cond = parser.getExpression(True)
-                    deps = new_cond.getDependencies(False, False)
+                    deps = new_cond.getDependencies(False, False, True)
                     [bias_dep, biases, ddt] = checkDependencies(deps, "If condition depends on", 0, "if", True, True)
                     if this_cond.type == "NOTHING":
                         this_cond = new_cond
@@ -6293,7 +6517,7 @@ def parseOther( line ):
             val = parser.lex()
 
         elif keywd == "endcase":
-            if len(gScopeList) > 0 and gScopeList[-1].startswith("CASE::"):
+            if gScopeList and gScopeList[-1].startswith("CASE::"):
                 gScopeList.pop()
             else:
                 error("Found 'endcase' without corresponding 'case'")
@@ -6515,7 +6739,7 @@ def parseOther( line ):
                         all_zero_assigns = False
                     gConditions.pop()
                     # ensure RHS values have all been set
-                    deps = rhs.getDependencies(True, False)
+                    deps = rhs.getDependencies(True, False, True)
                     [bias_dep, biases, ddt] = checkDependencies(deps, "Variable %s depends on"
                                                                 % varname, this_c_bd, False, False, True)
                     if ddt:
@@ -6682,7 +6906,7 @@ def parseOther( line ):
                     if val == ord('<') and parser.peekChar() == '+':
                         parser.getChar()
                         rhs = parser.getExpression()
-                        deps = rhs.getDependencies(False, False)
+                        deps = rhs.getDependencies(False, False, True)
                         acc_ref = acc + "(" + nname1
                         if nname2 != "":
                             acc_ref = acc_ref + "," + nname2
@@ -6706,7 +6930,7 @@ def parseOther( line ):
                                     if mult in deps:
                                         error("Unexpected '%s' in branch contribution" % mult)
                         # check dependencies again, but ignore bias_dep in _noise calls
-                        deps = rhs.getDependencies(False, True)
+                        deps = rhs.getDependencies(False, True, True)
                         [bias_dep, biases, ddt] = checkDependencies(deps, "Branch contribution depends on",
                                                                     this_c_bd, False, False, False)
                         if bias_dep == 4:
@@ -6715,7 +6939,7 @@ def parseOther( line ):
                             error("Branch contribution depends on quantity with bad derivative (from bias-dependent == or !=)")
                     elif val == ord(':'):
                         indirect = parser.getExpression()
-                        deps = indirect.getDependencies(False, False)
+                        deps = indirect.getDependencies(False, False, True)
                         [bias_dep, biases, ddt] = checkDependencies(deps, "Indirect branch contribution depends on",
                                                                     this_c_bd, False, False, True)
                         if ddt:  # pragma: no cover
@@ -6749,14 +6973,14 @@ def parseOther( line ):
                                "$fatal", "$error", "$warning", "$info", "$finish", "$stop"]:
                     gStatementInCurrentBlock = True
                     if val == ord('('):
-                        args = parser.parseArgList()
+                        args = parser.parseArgList(True)
                     else:
                         args = []
                     if keywd in ["$finish", "$stop"]:
                         arg = ""
                         if len(gLastDisplayTask) > 2 and gFileName[-1] == gLastDisplayTask[1] \
                                                      and gLineNo[-1] >= gLastDisplayTask[2]:
-                            if len(args) > 0:
+                            if args:
                                 arg = "(" + args[0].asString() + ")"
                             notice("$error(msg) preferred over %s(msg); %s%s;" % (gLastDisplayTask[0], keywd, arg))
                         else:
@@ -6767,11 +6991,13 @@ def parseOther( line ):
                         warning("%s() may degrade performance" % keywd)
                     elif keywd in ["$strobe", "$display", "$write"]:
                         gLastDisplayTask = [keywd, gFileName[-1], gLineNo[-1]]
+                    if keywd in ["$finish", "$stop", "$error"]:
+                        checkConditionsForFinish([this_cond])
 
                     if val == ord('('):
                         deps = []
                         for arg in args:
-                            deps += arg.getDependencies(False, False)
+                            deps += arg.getDependencies(False, False, True)
                         bias_dep = checkDependencies(deps, "Task %s references" % keywd, this_c_bd, False, False, True)[0]
                         if bias_dep and keywd in ["$strobe", "$display", "$write", "$warning", "$info",
                                                   "$fstrobe", "$fdisplay", "$fwrite", "$fmonitor"]:
@@ -6861,9 +7087,9 @@ def parseOther( line ):
                 val = parser.lex()
                 if val == ord('('):
                     arg.type = "FUNCCALL"
-                    arg.args = parser.parseArgList()
+                    arg.args = parser.parseArgList(True)
                     for farg in arg.args:
-                        deps = farg.getDependencies(False, False)
+                        deps = farg.getDependencies(False, False, True)
                         checkDependencies(deps, "%s event references" % arg.e1, this_c_bd, False, False, True)
                     if parser.peekChar() == ')':
                         parser.getChar()
@@ -6915,7 +7141,7 @@ def parseOther( line ):
     elif parser.isNumber():
         num = parser.getNumber()
         error("Unexpected number %d" % num)
-    elif val == ord(';') and len(gScopeList) > 0 and gScopeList[-1].startswith("CASE::"):
+    elif val == ord(';') and gScopeList and gScopeList[-1].startswith("CASE::"):
         pass  # null case statement
     else:
         error("Unexpected %s" % formatChar(val))
@@ -6952,25 +7178,49 @@ def getCurrentScope():
 def getCurrentConditions( cond_in, c_bd_in ):
     conds = ""
     bias_dep = c_bd_in
-    if cond_in.type != "NOTHING":
+    if cond_in and cond_in.type != "NOTHING":
         conds = cond_in.asString()
-    for cond in gConditionForNextStmt:
+    for cond in gConditionForNextStmt + gConditions:
         if cond.type != "NOTHING":
             if conds != "":
                 conds += "&&"
             conds += cond.asString()
-    for cond in gConditions:
-        if cond.type != "NOTHING":
-            if conds != "":
-                conds += "&&"
-            conds += cond.asString()
-    for c_bd in gCondBiasDForNextStmt:
-        if c_bd > bias_dep:
-            bias_dep = c_bd
-    for c_bd in gCondBiasDep:
+    for c_bd in gCondBiasDForNextStmt + gCondBiasDep:
         if c_bd > bias_dep:
             bias_dep = c_bd
     return [conds, bias_dep]
+
+
+def getCurrentConditionDeps( ):
+    deps = []
+    for cond in gConditionForNextStmt + gConditions:
+        if cond.type not in ["NOTHING", "EVENT"]:
+            deps += cond.getDependencies(False, False, False)
+    return deps
+
+
+# $finish/$stop/$error called under current conditions
+# may imply a restriction on parameter values
+def checkConditionsForFinish(cond_in):
+    for cond in cond_in + gConditionForNextStmt + gConditions:
+        check_arg = False
+        if cond.type == "<" and cond.e2.type == "NUMBER" and cond.e2.number > 0:
+            check_arg = cond.e1
+        elif cond.type == "<=" and cond.e2.type == "NUMBER" and cond.e2.number >= 0:
+            check_arg = cond.e1
+        elif cond.type == "NAME":
+            check_arg = cond
+        if check_arg:
+            if check_arg.type == "NAME":
+                check_arg = check_arg.e1
+                if check_arg in gParameters:
+                    gParameters[check_arg].exclude.append(0)
+                else:
+                    vn = findVariableInScope(check_arg)
+                    if vn in gVariables:
+                        for fac in gVariables[vn].zeros + gVariables[vn].cond_deps:
+                            if fac in gParameters:
+                                gParameters[fac].exclude.append(0)
 
 
 # create disciplines, else it's pointless to continue
@@ -7038,7 +7288,7 @@ def handleCompilerDirectives( line ):
         if stop < len(line):
             error("Extra characters after `ifdef")
         if line.startswith("`elsif"):
-            if len(gIfDefStatus) > 0:
+            if gIfDefStatus:
                 if gIfDefStatus[-1] == "FALSE":
                     if token in gMacros:
                         gMacros[token].used = True
@@ -7060,7 +7310,7 @@ def handleCompilerDirectives( line ):
         if "elseif" not in gMacros:
             error("Undefined macro `elseif (was `elsif intended?)")
     elif line.startswith("`else"):
-        if len(gIfDefStatus) > 0:
+        if gIfDefStatus:
             if gIfDefStatus[-1] == "FALSE":
                 gIfDefStatus[-1] = "TRUE"
             else: # TRUE, TRUE:elsif, FALSE:elsif means was TRUE at some point
@@ -7072,7 +7322,7 @@ def handleCompilerDirectives( line ):
         start = 6
         if len(line) > start and not line[start].isspace():
             error("Missing space after %s" % line[0:start])
-        if len(gIfDefStatus) > 0:
+        if gIfDefStatus:
             gIfDefStatus.pop()
         else:
             error("Unmatched `endif")
@@ -7103,7 +7353,7 @@ def handleCompilerDirectives( line ):
                         fname = fname[0:qt]
                     elif qt == 0:
                         error("Empty filename for `include")
-                        rest = fname[1:].strip()
+                        rest  = fname[1:].strip()
                         fname = ""
                     else:
                         error("Missing end-quote for `include")
@@ -7154,7 +7404,7 @@ def handleCompilerDirectives( line ):
                             gMissingConstantsFile = fname
                         else:
                             error("File not found: %s" % line)
-                if len(rest) > 0:
+                if rest:
                     if rest.startswith("`include"):
                         error("Multiple `include directives on one line")
                         rest = rest[8:].strip()
@@ -7317,7 +7567,7 @@ def parseLines( lines ):
                 gStatementInCurrentBlock = False
             elif part.startswith("endfunction"):
                 gStatementInCurrentBlock = False
-                if len(gScopeList) > 0 and gScopeList[-1].startswith("FUNCTION::"):
+                if gScopeList and gScopeList[-1].startswith("FUNCTION::"):
                     if gCurrentFunc:
                         fname = gCurrentFunc.name
                         fscope = gScopeList[-1]
@@ -7346,7 +7596,7 @@ def parseLines( lines ):
                                 elif not var.used and not var.assign == 0:
                                     warning("In function %s, variable '%s' was never used" % (fname, vn))
                         if not func_assign:
-                            if len(gCurrentFunc.outputs) > 0:
+                            if gCurrentFunc.outputs:
                                 warning("Function '%s' is not assigned a return value" % gCurrentFunc.name)
                             else:
                                 error("Function '%s' is not assigned a return value" % gCurrentFunc.name)
@@ -7391,7 +7641,7 @@ def parseLines( lines ):
                         j = tmpj
                         gLineNo[-1] = j
                 if part.startswith("parameter") or part.startswith("aliasparam") or part.startswith("localparam"):
-                    parseParamDecl(part, attribs)
+                    parseParamDecl(part, attribs, True)
                 elif part.startswith("inout") or part.startswith("input") or part.startswith("output"):
                     parsePortDirection(part)
                 else:
@@ -7604,6 +7854,7 @@ def parseFile( filename ):
 
     if gStyle:
         if filename.find("disciplines.vams") >= 0 or filename.find("discipline.h") >= 0 \
+                or filename.find("disciplines.h") >= 0 \
                 or filename.find("constants.vams") >= 0 or filename.find("constants.h") >= 0:
             # turn off style-checking for standard header files
             check_style = False
@@ -7752,7 +8003,8 @@ def parseFile( filename ):
                         if stripped.endswith("\\"):
                             stripped = stripped[:-1].strip()
                         if len(orig_line) > 2 and orig_line[-3] != ' ':
-                            style("Prefer space before \\")
+                            if orig_line[-3] != '\t':
+                                style("Prefer space before \\")
                             if gFixIndent:
                                 fixed_line = fixed_line[:-2] + " \\\n"
                     parser = Parser(line)
@@ -7812,6 +8064,10 @@ def parseFile( filename ):
                         if (indent_ifdef != 0 and stripped.startswith("`else")) or \
                                (indent_ifdef == -1 and stripped.startswith("`endif")):
                             this_indent -= gSpcPerInd
+                        if indent_ifdef > 0 and (stripped.startswith("`else") or stripped.startswith("`endif")) and \
+                                ifdef_depth > 1 and len(indents_in_ifdefs) == ifdef_depth:
+                            depth = indents_in_ifdefs[ifdef_depth-2]
+                            this_indent = depth[0]
                     if in_multiline_define:
                         this_indent += special_define_indent
                     previous_single_indent = single_line_indent
@@ -7925,7 +8181,7 @@ def parseFile( filename ):
                                                   % first_define_indent )
                                             if gFixIndent:
                                                 fixed_line = fixed_line.strip() + "\n"
-                                if indent not in [0, required_indent]:
+                                if indent not in [-1, 0, required_indent]:
                                     if required_indent != 0:
                                         style("Incorrect indent: %d, should be %d (or 0)"
                                               % (indent, required_indent), "Incorrect indent")
@@ -7998,8 +8254,6 @@ def parseFile( filename ):
                                         indents_in_ifdefs.pop()
                                         ifdef_depth -= 1
                                     if indent_inside_ifdef > 0:
-                                        if this_indent >= gSpcPerInd:
-                                            this_indent -= gSpcPerInd
                                         if required_indent >= gSpcPerInd:
                                             required_indent -= gSpcPerInd
                                     elif indent_inside_ifdef == -1:
@@ -8193,7 +8447,7 @@ def parseFile( filename ):
     # done with this file
     gFileName.pop()
     gLineNo.pop()
-    if len(gFileName) == 0 and len(gScopeList) > 0:
+    if len(gFileName) == 0 and gScopeList:
         error("Missing 'endmodule'")
 
     return lines_of_code
