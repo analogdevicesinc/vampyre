@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """ VAMPyRE
     Verilog-A Model Pythonic Rule Enforcer
-    version 1.9.4, 17-Apr-2024
+    version 1.9.5, 6-Mar-2025
 
     intended for checking for issues like:
      1) hidden state (variables used before assigned)
@@ -27,7 +27,7 @@
     15) superfluous assignments
     16) order-of-operation problems with macro expansions
 
-    Copyright (c) 2024 Analog Devices, Inc.
+    Copyright (c) 2025 Analog Devices, Inc.
 
     Licensed under Educational Community License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License. You may
@@ -52,7 +52,7 @@ from copy import deepcopy
 ################################################################################
 # global variables
 
-gVersionNumber = "1.9.4"
+gVersionNumber = "1.9.5"
 gModuleName    = ""
 gNatures       = {}
 gDisciplines   = {}
@@ -1592,6 +1592,14 @@ class Parser:
         expr = self.parseMultiplicative(is_cond, do_warn)
         while self.peekOper() in ["+", "-"]:
             oper = self.getOper()
+            warn = ""
+            if self.peekOper() == "+":
+                warn = oper + " +"
+            # - -1 occurs frequently in macro replacement
+            #elif self.peekOper() == "-":
+            #    warn = oper + " -"
+            if do_warn and warn:
+                warning("Adjacent unary operators: '%s'" % warn)
             lhs = expr
             rhs = self.parseMultiplicative(is_cond, do_warn)
             expr = Expression(oper)
@@ -3541,7 +3549,7 @@ def printModuleSummary():
             printList(gVariables.keys(), "    ", 70)
 
     if gCompactModel and len(gHiddenState):
-        print("Possible hidden-state variables:")
+        print("\nPossible hidden-state variables:")
         printList(gHiddenState.keys(), "    ", 70)
 # end of printModuleSummary
 
@@ -4443,7 +4451,10 @@ def countMultFactors( mname, factors, noise ):
                 inside = fac
             count += 1
         elif fac in gMultFactors and fac not in errs:
-            error("Contribution has unexpected factor of %s (expected %s)" % (fac, mname))
+            if mname in factors:
+                error("Contribution has unexpected factor of %s" % fac)
+            else:
+                error("Contribution has unexpected factor of %s (expected %s)" % (fac, mname))
             errs.append(fac)
     if count > 1:
         error("Contribution has extra factor of %s" % mname)
@@ -4451,11 +4462,9 @@ def countMultFactors( mname, factors, noise ):
         error("Factor '%s' should be inside call to %s()" % (inside, noise))
 
 
-def checkMultFactors( rhs ):
+def splitAdditiveTerms( expr ):
     parts = []
-    more = [rhs]
-
-    # split all additive terms
+    more = expr
     while len(parts) != len(more):
         parts = more
         more = []
@@ -4466,25 +4475,56 @@ def checkMultFactors( rhs ):
                     more.append(part.e2)
             else:
                 more.append(part)
-    parts = more
+    return parts
+
+
+def checkMultFactors( rhs ):
+    parts = []
+    more = [rhs]
+
+    if rhs.type == "*":
+        if rhs.e1.type == "NAME" and rhs.e2.type in ["+", "-"]:
+            # a * (b + c + ... + z) => a*b + a*c + ... + a*z
+            more = []
+            parts = splitAdditiveTerms([rhs.e2])
+            for part in parts:
+                new_part = Expression("*")
+                new_part.e1 = Expression("NAME")
+                new_part.e1.e1 = rhs.e1.e1
+                new_part.e2 = part
+                more.append(new_part)
+        elif rhs.e2.type == "NAME" and rhs.e1.type in ["+", "-"]:
+            # (a + b + ... + z) * c => a*c + b*c + ... + z*c
+            print("hi there")
+            more = []
+            parts = splitAdditiveTerms([rhs.e1])
+            for part in parts:
+                new_part = Expression("*")
+                new_part.e1 = part
+                new_part.e2 = Expression("NAME")
+                new_part.e2.e1 = rhs.e2.e1
+                more.append(new_part)
+
+    parts = splitAdditiveTerms(more)
 
     # classify
     for part in parts:
+        if part.type == "NUMBER" and part.number == 0:
+            continue
         factors = getFactors(part)
         if "flicker_noise" in factors:
             if "mult_fn" in factors:
                 countMultFactors("mult_fn", factors, "flicker_noise")
             elif "MULT_FN" in factors:
                 countMultFactors("MULT_FN", factors, "flicker_noise")
+            elif "MULT_I" in factors:
+                error("Flicker noise contribution uses MULT_I instead of MULT_FN")
+            elif "mult_i" in factors:
+                error("Flicker noise contribution uses mult_i instead of mult_fn")
+            elif "MULT_FN" in gParameters:
+                error("Flicker noise contribution missing MULT_FN")
             else:
-                if "MULT_I" in factors:
-                    error("Flicker noise contribution uses MULT_I instead of MULT_FN")
-                elif "mult_i" in factors:
-                    error("Flicker noise contribution uses mult_i instead of mult_fn")
-                elif "MULT_FN" in gParameters:
-                    error("Flicker noise contribution missing MULT_FN")
-                else:
-                    error("Flicker noise contribution missing mult_fn")
+                error("Flicker noise contribution missing mult_fn")
         elif "white_noise" in factors:
             if "mult_i" in factors:
                 countMultFactors("mult_i", factors, "white_noise")
@@ -4499,20 +4539,23 @@ def checkMultFactors( rhs ):
                 countMultFactors("mult_q", factors, "")
             elif "MULT_Q" in factors:
                 countMultFactors("MULT_Q", factors, "")
+            elif "MULT_I" in factors:
+                error("Charge contribution uses MULT_I instead of MULT_Q")
+            elif "mult_i" in factors:
+                error("Charge contribution uses mult_i instead of mult_q")
+            elif "MULT_Q" in gParameters:
+                error("Charge contribution missing MULT_Q")
             else:
-                if "MULT_I" in factors:
-                    error("Charge contribution uses MULT_I instead of MULT_Q")
-                elif "mult_i" in factors:
-                    error("Charge contribution uses mult_i instead of mult_q")
-                elif "MULT_Q" in gParameters:
-                    error("Charge contribution missing MULT_Q")
-                else:
-                    error("Charge contribution missing mult_q")
+                error("Charge contribution missing mult_q")
         else:
             if "mult_i" in factors:
                 countMultFactors("mult_i", factors, "")
             elif "MULT_I" in factors:
                 countMultFactors("MULT_I", factors, "")
+            elif "MULT_Q" in factors:
+                error("Current contribution uses MULT_Q instead of MULT_I")
+            elif "mult_i" in factors:
+                error("Current contribution uses mult_q instead of mult_i")
             elif "MULT_I" in gParameters:
                 error("Current contribution missing MULT_I")
             else:
@@ -5041,7 +5084,7 @@ def checkParmsAndVars():
                         parname = par.name
                         break
                 warning("Operating-point variable '%s' differs only in case from parameter '%s'" % (var.name, parname))
-            if var.oppt and (mult_i or mult_q):
+            if var.oppt and (mult_i or mult_q) and var.non_zero_assign:
                 if var.units in ["A", "A/V", "mho"]:
                     if not mult_i or not mult_i.name in var.factors:
                         if mult_i:
